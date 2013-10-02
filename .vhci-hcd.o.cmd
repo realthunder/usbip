@@ -1,1 +1,0 @@
-cmd_drivers/staging/usbip/vhci-hcd.o := mipsel-openwrt-linux-uclibc-ld  -m elf32ltsmip   -r -o drivers/staging/usbip/vhci-hcd.o drivers/staging/usbip/vhci_sysfs.o drivers/staging/usbip/vhci_tx.o drivers/staging/usbip/vhci_rx.o drivers/staging/usbip/vhci_hcd.o 
