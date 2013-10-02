@@ -1,0 +1,5 @@
+# Motivation
+
+This is forked from the usbip source in linux kernel. The [USB/IP](http://usbip.sourceforge.net/) project aims to develop a general USB device sharing system over IP network. This fork is aim to add support of filter type module for application lay acceleration. Current priority is focused on USB PTP (Picture Transfer Protocol) devices, such as digital camera. 
+
+Typical USB PTP device carries all data transfer through two bulk endpoints, one in and one out. Each transaction consists of request, data (optional), and response phases, and the transactions must be serialized. This plus the fact of relatively high latency in network communication causes serious lags in functions like live-preview in digital camera. This fork is aimed to add application layer parser in the form of filter on the USB device side, to detect live-view requests and pre-fetch live-view images before receiving the actual requests from the USB host side. This filter enhancement shall maintain compatibility to existing USB/IP protocol, and be transparent to existing USB/IP clients (i.e. on the USB host side).
