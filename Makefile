@@ -8,3 +8,9 @@ vhci-hcd-y := vhci_sysfs.o vhci_tx.o vhci_rx.o vhci_hcd.o
 
 obj-$(CONFIG_USBIP_HOST) += usbip-host.o
 usbip-host-y := stub_dev.o stub_main.o stub_rx.o stub_tx.o
+
+obj-$(CONFIG_USBIP_FILTER_PTP) += usbip-filter-ptp.o
+usbip-filter-ptp-y := filter_ptp.o
+
+CFLAGS_filter_ptp.o := -DDEBUG
+

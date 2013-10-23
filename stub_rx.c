@@ -453,10 +453,9 @@ static void masking_bogus_flags(struct urb *urb)
 	urb->transfer_flags &= allowed;
 }
 
-static void stub_recv_cmd_submit(struct stub_device *sdev,
-				 struct usbip_header *pdu)
+struct urb *stub_build_urb(struct stub_device *sdev,
+        struct usbip_header *pdu, void *data)
 {
-	int ret;
 	struct stub_priv *priv;
 	struct usbip_device *ud = &sdev->ud;
 	struct usb_device *udev = sdev->udev;
@@ -464,7 +463,7 @@ static void stub_recv_cmd_submit(struct stub_device *sdev,
 
 	priv = stub_priv_alloc(sdev, pdu);
 	if (!priv)
-		return;
+		return NULL;
 
 	/* setup a urb */
 	if (usb_pipeisoc(pipe))
@@ -476,17 +475,21 @@ static void stub_recv_cmd_submit(struct stub_device *sdev,
 	if (!priv->urb) {
 		dev_err(&sdev->interface->dev, "malloc urb\n");
 		usbip_event_add(ud, SDEV_EVENT_ERROR_MALLOC);
-		return;
+		return NULL;
 	}
 
 	/* allocate urb transfer buffer, if needed */
 	if (pdu->u.cmd_submit.transfer_buffer_length > 0) {
-		priv->urb->transfer_buffer =
-			kzalloc(pdu->u.cmd_submit.transfer_buffer_length,
-				GFP_KERNEL);
+        if(data) 
+            priv->urb->transfer_buffer = kmemdup(data,
+                    pdu->u.cmd_submit.transfer_buffer_length, GFP_KERNEL);
+        else
+            priv->urb->transfer_buffer =
+                kzalloc(pdu->u.cmd_submit.transfer_buffer_length,
+                    GFP_KERNEL);
 		if (!priv->urb->transfer_buffer) {
 			usbip_event_add(ud, SDEV_EVENT_ERROR_MALLOC);
-			return;
+			return NULL;
 		}
 	}
 
@@ -496,7 +499,7 @@ static void stub_recv_cmd_submit(struct stub_device *sdev,
 	if (!priv->urb->setup_packet) {
 		dev_err(&sdev->interface->dev, "allocate setup_packet\n");
 		usbip_event_add(ud, SDEV_EVENT_ERROR_MALLOC);
-		return;
+		return NULL;
 	}
 
 	/* set other members from the base header of pdu */
@@ -507,19 +510,30 @@ static void stub_recv_cmd_submit(struct stub_device *sdev,
 
 	usbip_pack_pdu(pdu, priv->urb, USBIP_CMD_SUBMIT, 0);
 
+    if(!data) {
+        if (usbip_recv_xbuff(ud, priv->urb) < 0)
+            return NULL;
 
-	if (usbip_recv_xbuff(ud, priv->urb) < 0)
-		return;
-
-	if (usbip_recv_iso(ud, priv->urb) < 0)
-		return;
+        if (usbip_recv_iso(ud, priv->urb) < 0)
+            return NULL;
+    }
 
 	/* no need to submit an intercepted request, but harmless? */
 	tweak_special_requests(priv->urb);
 
 	masking_bogus_flags(priv->urb);
+
+    return priv->urb;
+}
+EXPORT_SYMBOL_GPL(stub_build_urb);
+
+int stub_submit_urb(struct stub_device *sdev,
+        struct usbip_header *pdu, struct urb *urb)
+{
+	struct usbip_device *ud = &sdev->ud;
+    int ret;
 	/* urb is now ready to submit */
-	ret = usb_submit_urb(priv->urb, GFP_KERNEL);
+	ret = usb_submit_urb(urb, GFP_KERNEL);
 
 	if (ret == 0)
 		usbip_dbg_stub_rx("submit urb ok, seqnum %u\n",
@@ -527,7 +541,7 @@ static void stub_recv_cmd_submit(struct stub_device *sdev,
 	else {
 		dev_err(&sdev->interface->dev, "submit_urb error, %d\n", ret);
 		usbip_dump_header(pdu);
-		usbip_dump_urb(priv->urb);
+		usbip_dump_urb(urb);
 
 		/*
 		 * Pessimistic.
@@ -535,9 +549,22 @@ static void stub_recv_cmd_submit(struct stub_device *sdev,
 		 */
 		usbip_event_add(ud, SDEV_EVENT_ERROR_SUBMIT);
 	}
+    return ret;
+}
+EXPORT_SYMBOL_GPL(stub_submit_urb);
 
-	usbip_dbg_stub_rx("Leave\n");
-	return;
+static void stub_recv_cmd_submit(struct stub_device *sdev,
+		struct usbip_header *pdu)
+{
+    struct urb *urb;
+	struct usbip_device *ud = &sdev->ud;
+
+    urb = stub_build_urb(sdev,pdu,NULL);
+
+    if(!urb || usbip_filter_on_rx(ud,pdu,urb))
+        return;
+
+    stub_submit_urb(sdev,pdu,urb);
 }
 
 /* recv a pdu */

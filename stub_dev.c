@@ -306,6 +306,8 @@ static struct stub_device *stub_device_alloc(struct usb_device *udev,
 	sdev->ud.status		= SDEV_ST_AVAILABLE;
 	spin_lock_init(&sdev->ud.lock);
 	sdev->ud.tcp_socket	= NULL;
+    INIT_LIST_HEAD(&sdev->ud.filters);
+	spin_lock_init(&sdev->ud.filter_lock);
 
 	INIT_LIST_HEAD(&sdev->priv_init);
 	INIT_LIST_HEAD(&sdev->priv_tx);
@@ -439,6 +441,7 @@ static int stub_probe(struct usb_interface *interface,
 	}
 	busid_priv->status = STUB_BUSID_ALLOC;
 
+    usbip_filter_probe(&sdev->ud,interface);
 	return 0;
 }
 
@@ -478,6 +481,8 @@ static void stub_disconnect(struct usb_interface *interface)
 		dev_err(&interface->dev, "could not get device");
 		return;
 	}
+
+    usbip_filter_remove(&sdev->ud,NULL);
 
 	usb_set_intfdata(interface, NULL);
 

@@ -23,7 +23,7 @@
 #include "usbip_common.h"
 #include "stub.h"
 
-static void stub_free_priv_and_urb(struct stub_priv *priv)
+void stub_free_priv_and_urb(struct stub_priv *priv)
 {
 	struct urb *urb = priv->urb;
 
@@ -33,6 +33,7 @@ static void stub_free_priv_and_urb(struct stub_priv *priv)
 	kmem_cache_free(stub_priv_cache, priv);
 	usb_free_urb(urb);
 }
+EXPORT_SYMBOL_GPL(stub_free_priv_and_urb);
 
 /* be in spin_lock_irqsave(&sdev->priv_lock, flags) */
 void stub_enqueue_ret_unlink(struct stub_device *sdev, __u32 seqnum,
@@ -63,11 +64,14 @@ void stub_enqueue_ret_unlink(struct stub_device *sdev, __u32 seqnum,
  */
 void stub_complete(struct urb *urb)
 {
+    int ret;
 	struct stub_priv *priv = (struct stub_priv *) urb->context;
 	struct stub_device *sdev = priv->sdev;
 	unsigned long flags;
 
 	usbip_dbg_stub_tx("complete! status %d\n", urb->status);
+
+    ret = usbip_filter_on_tx(&sdev->ud,urb);
 
 	switch (urb->status) {
 	case 0:
@@ -94,6 +98,8 @@ void stub_complete(struct urb *urb)
 		break;
 	}
 
+    if(ret) return;
+
 	/* link a urb to the queue of tx. */
 	spin_lock_irqsave(&sdev->priv_lock, flags);
 	if (priv->unlinking) {
@@ -107,6 +113,7 @@ void stub_complete(struct urb *urb)
 	/* wake up tx_thread */
 	wake_up(&sdev->tx_waitq);
 }
+EXPORT_SYMBOL_GPL(stub_complete);
 
 static inline void setup_base_pdu(struct usbip_header_basic *base,
 				  __u32 command, __u32 seqnum)

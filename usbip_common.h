@@ -268,6 +268,37 @@ enum usbip_status {
 #define	VDEV_EVENT_ERROR_TCP	(USBIP_EH_SHUTDOWN | USBIP_EH_RESET)
 #define	VDEV_EVENT_ERROR_MALLOC	(USBIP_EH_SHUTDOWN | USBIP_EH_UNUSABLE)
 
+struct usbip_device;
+struct usbip_filter;
+
+struct usbip_filter_driver {
+	struct list_head list;
+    char *name;
+    void *(*probe)(struct usbip_device *ud, 
+            struct usb_interface *interface);
+    void (*remove)(struct usbip_filter *filter);
+    int (*on_tx)(struct usbip_filter *filter, struct urb *urb);
+    int (*on_rx)(struct usbip_filter *filter, 
+            struct usbip_header *pdu, struct urb *urb);
+};
+
+void usbip_filter_register(struct usbip_filter_driver *drv);
+void usbip_filter_unregister(struct usbip_filter_driver *drv);
+void usbip_filter_probe(struct usbip_device *ud,
+        struct usb_interface *interface);
+void usbip_filter_remove(struct usbip_device *ud,
+        struct usbip_filter_driver *drv);
+int usbip_filter_on_rx(struct usbip_device *ud, 
+        struct usbip_header *pdu, struct urb *urb);
+int usbip_filter_on_tx(struct usbip_device *ud, struct urb *urb);
+
+struct usbip_filter {
+	struct list_head list;
+    struct usbip_device *ud;
+    struct usbip_filter_driver *drv;
+    void *priv;
+};
+
 /* a common structure for stub_device and vhci_device */
 struct usbip_device {
 	enum usbip_side side;
@@ -290,6 +321,9 @@ struct usbip_device {
 		void (*reset)(struct usbip_device *);
 		void (*unusable)(struct usbip_device *);
 	} eh_ops;
+
+	spinlock_t filter_lock;
+	struct list_head filters;
 };
 
 #define kthread_get_run(threadfn, data, namefmt, ...)			   \

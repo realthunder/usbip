@@ -380,6 +380,7 @@ int usbip_recv(struct socket *sock, void *buf, int size)
 		total += result;
 	} while (size > 0);
 
+
 	if (usbip_dbg_flag_xmit) {
 		if (!in_interrupt())
 			pr_debug("%-10s:", current->comm);
@@ -799,8 +800,116 @@ int usbip_recv_xbuff(struct usbip_device *ud, struct urb *urb)
 }
 EXPORT_SYMBOL_GPL(usbip_recv_xbuff);
 
+static struct {
+    struct list_head list;
+	spinlock_t lock;
+}usbip_filters;
+
+void usbip_filter_register(struct usbip_filter_driver *drv) {
+    spin_lock(&usbip_filters.lock);
+	list_add_tail(&drv->list, &usbip_filters.list);
+    spin_unlock(&usbip_filters.lock);
+}
+EXPORT_SYMBOL_GPL(usbip_filter_register);
+
+void usbip_filter_unregister(struct usbip_filter_driver *drv) {
+#define BEGIN_FOR_EACH_DRIVER \
+    {\
+        struct list_head *pos;\
+        spin_lock(&usbip_filters.lock);\
+        list_for_each(pos,&usbip_filters.list) 
+#define END_FOR_EACH_DRIVER \
+        spin_unlock(&usbip_filters.lock);\
+    }
+
+    BEGIN_FOR_EACH_DRIVER {
+        if(pos == &drv->list) {
+            list_del(pos);
+            break;
+        }
+    }
+    END_FOR_EACH_DRIVER;
+}
+EXPORT_SYMBOL_GPL(usbip_filter_unregister);
+
+void usbip_filter_probe(struct usbip_device *ud,
+        struct usb_interface *interface)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&ud->filter_lock,flags);
+    BEGIN_FOR_EACH_DRIVER {
+        struct usbip_filter_driver *drv;
+        drv = list_entry(pos, struct usbip_filter_driver,list);
+        if(drv->probe) {
+            void *priv = drv->probe(ud,interface);
+            if(priv) {
+                struct usbip_filter *filter;
+                filter = (struct usbip_filter *)kmalloc(
+                        sizeof(struct usbip_filter),GFP_KERNEL);
+                if(!filter) break;
+                INIT_LIST_HEAD(&filter->list);
+                filter->priv = priv;
+                filter->ud = ud;
+                filter->drv = drv;
+                list_add_tail(&ud->filters,&filter->list);
+            }
+        }
+    }
+    END_FOR_EACH_DRIVER;
+    spin_unlock_irqrestore(&ud->filter_lock,flags);
+}
+EXPORT_SYMBOL_GPL(usbip_filter_probe);
+
+void usbip_filter_remove(struct usbip_device *ud, 
+        struct usbip_filter_driver *drv) 
+{
+#define BEGIN_FOR_EACH_FILTER \
+    {\
+        struct list_head *pos,*ptmp;\
+        unsigned long flags; \
+        spin_lock_irqsave(&ud->filter_lock,flags);\
+        list_for_each_safe(pos,ptmp,&ud->filters){ \
+            struct usbip_filter *filter = \
+                list_entry(pos,struct usbip_filter,list);
+#define END_FOR_EACH_FILTER \
+        }\
+        spin_unlock_irqrestore(&ud->filter_lock,flags);\
+    }
+
+    BEGIN_FOR_EACH_FILTER;
+        if(!drv && drv!=filter->drv) continue;
+        if(drv->remove) drv->remove(filter);
+        list_del(pos);
+        kfree(filter);
+    END_FOR_EACH_FILTER;
+}
+EXPORT_SYMBOL_GPL(usbip_filter_remove);
+
+int usbip_filter_on_rx(struct usbip_device *ud, 
+        struct usbip_header *pdu, struct urb *urb){
+    int ret = 0;
+    BEGIN_FOR_EACH_FILTER;
+        if(filter->drv->on_rx && (ret=filter->drv->on_rx(filter,pdu,urb))) 
+            break;
+    END_FOR_EACH_FILTER;
+    return ret;
+}
+EXPORT_SYMBOL_GPL(usbip_filter_on_rx);
+
+int usbip_filter_on_tx(struct usbip_device *ud, struct urb *urb){
+    int ret = 0;
+    BEGIN_FOR_EACH_FILTER;
+        if(filter->drv->on_tx && (ret=filter->drv->on_tx(filter,urb))) 
+            break;
+    END_FOR_EACH_FILTER;
+    return ret;
+}
+EXPORT_SYMBOL_GPL(usbip_filter_on_tx);
+
 static int __init usbip_core_init(void)
 {
+	spin_lock_init(&usbip_filters.lock);
+    INIT_LIST_HEAD(&usbip_filters.list);
 	pr_info(DRIVER_DESC " v" USBIP_VERSION "\n");
 	return 0;
 }

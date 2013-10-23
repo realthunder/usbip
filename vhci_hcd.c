@@ -858,6 +858,8 @@ static void vhci_device_init(struct vhci_device *vdev)
 
 	vdev->ud.side   = USBIP_VHCI;
 	vdev->ud.status = VDEV_ST_NULL;
+    INIT_LIST_HEAD(&vdev->ud.filters);
+    spin_lock_init(&vdev->ud.filter_lock);
 	spin_lock_init(&vdev->ud.lock);
 
 	INIT_LIST_HEAD(&vdev->priv_rx);

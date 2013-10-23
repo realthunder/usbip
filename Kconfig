@@ -37,6 +37,14 @@ config USBIP_HOST
 	  To compile this driver as a module, choose M here: the
 	  module will be called usbip-host.
 
+config USBIP_FILTER_PTP
+    tristate "PTP filter driver"
+    depends on USBIP_HOST
+    default N
+    ---help---
+        Filter driver for USB PTP devices to accelerate live
+        preview operation.
+
 config USBIP_DEBUG
 	bool "Debug messages for USB/IP"
 	depends on USBIP_CORE

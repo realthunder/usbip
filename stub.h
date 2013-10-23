@@ -43,7 +43,7 @@ struct stub_device {
 	 * stub_priv preserves private data of each urb.
 	 * It is allocated as stub_priv_cache and assigned to urb->context.
 	 *
-	 * stub_priv is always linked to any one of 3 lists;
+	 * stub_priv is always linked to any one of 4 lists;
 	 *	priv_init: linked to this until the comletion of a urb.
 	 *	priv_tx  : linked to this after the completion of a urb.
 	 *	priv_free: linked to this after the sending of the result.
@@ -68,6 +68,9 @@ struct stub_priv {
 	struct list_head list;
 	struct stub_device *sdev;
 	struct urb *urb;
+
+    /* reserved for filter use */
+    void *priv;
 
 	int unlinking;
 };
@@ -102,6 +105,11 @@ void stub_device_cleanup_urbs(struct stub_device *sdev);
 
 /* stub_rx.c */
 int stub_rx_loop(void *data);
+int stub_submit_urb(struct stub_device *sdev,
+        struct usbip_header *pdu, struct urb *urb);
+struct urb *stub_build_urb(struct stub_device *sdev,
+        struct usbip_header *pdu, void *data);
+void stub_free_priv_and_urb(struct stub_priv *priv);
 
 /* stub_tx.c */
 void stub_enqueue_ret_unlink(struct stub_device *sdev, __u32 seqnum,
