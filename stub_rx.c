@@ -481,8 +481,9 @@ struct urb *stub_build_urb(struct stub_device *sdev,
 	/* allocate urb transfer buffer, if needed */
 	if (pdu->u.cmd_submit.transfer_buffer_length > 0) {
         if(data) 
-            priv->urb->transfer_buffer = kmemdup(data,
-                    pdu->u.cmd_submit.transfer_buffer_length, GFP_KERNEL);
+            priv->urb->transfer_buffer = data;
+            /* priv->urb->transfer_buffer = kmemdup(data, */
+                    /* pdu->u.cmd_submit.transfer_buffer_length, GFP_KERNEL); */
         else
             priv->urb->transfer_buffer =
                 kzalloc(pdu->u.cmd_submit.transfer_buffer_length,
@@ -535,12 +536,12 @@ int stub_submit_urb(struct stub_device *sdev,
 	/* urb is now ready to submit */
 	ret = usb_submit_urb(urb, GFP_KERNEL);
 
-	if (ret == 0)
-		usbip_dbg_stub_rx("submit urb ok, seqnum %u\n",
+	if (ret == 0) {
+        if(pdu) usbip_dbg_stub_rx("submit urb ok, seqnum %u\n",
 				  pdu->base.seqnum);
-	else {
+    }else {
 		dev_err(&sdev->interface->dev, "submit_urb error, %d\n", ret);
-		usbip_dump_header(pdu);
+        if(pdu) usbip_dump_header(pdu);
 		usbip_dump_urb(urb);
 
 		/*
@@ -560,10 +561,8 @@ static void stub_recv_cmd_submit(struct stub_device *sdev,
 	struct usbip_device *ud = &sdev->ud;
 
     urb = stub_build_urb(sdev,pdu,NULL);
-
     if(!urb || usbip_filter_on_rx(ud,pdu,urb))
         return;
-
     stub_submit_urb(sdev,pdu,urb);
 }
 

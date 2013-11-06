@@ -886,7 +886,8 @@ void usbip_filter_remove(struct usbip_device *ud,
 EXPORT_SYMBOL_GPL(usbip_filter_remove);
 
 int usbip_filter_on_rx(struct usbip_device *ud, 
-        struct usbip_header *pdu, struct urb *urb){
+        struct usbip_header *pdu, struct urb *urb)
+{
     int ret = 0;
     BEGIN_FOR_EACH_FILTER;
         if(filter->drv->on_rx && (ret=filter->drv->on_rx(filter,pdu,urb))) 
