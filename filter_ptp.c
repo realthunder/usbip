@@ -38,7 +38,7 @@
 #define DRIVER_AUTHOR "Zheng, Lei <realthunder.dev@gmail.com>"
 #define DRIVER_DESC "USB/IP Filter for PTP"
 
-#define TRACE_STREAM
+/* #define TRACE_STREAM */
 
 /* Desired frame rate for preview */
 unsigned int usbip_ptp_fps = 10;
@@ -104,14 +104,12 @@ enum ptp_parser_state {
     /* in the middle of an unknown phase */
     ptpps_unkonwn = 4,
 
-    /* in the middle of receiving the ptp pdu header */
-    ptpps_header = 5,
-
     /* not in the middle of any phase, and waiting for the response phase */
     ptpps_wait_response = 6,
 };
 
 struct ptp_state_machine {
+    const char *type;
     int state;
     u32 size;
     PTPUSBBulkHeader ptpdu;
@@ -132,9 +130,7 @@ struct ptp_filter {
     }trigger;
 
     int frame_count;
-
     int frame_serving;
-    u32 frame_serving_trans_id;
 
     int in_pipe;
     int out_pipe;
@@ -168,6 +164,13 @@ struct ptp_filter {
     /* this tail marks the start of the last complete frame. */
     int frame_rx_tail2;
 
+#define ptp_framebuf_align_shift 6
+#define ptp_framebuf_align_mask ((1<<ptp_framebuf_align_shift)-1)
+#define ptp_framebuf_align(_pt) \
+    do{\
+        if(_pt&ptp_framebuf_align_mask) \
+            _pt=((_pt>>ptp_framebuf_align_shift)+1)<<ptp_framebuf_align_shift;\
+    }while(0)
 #define ptp_framebuf_full_size (1024*1024)
 #define ptp_framebuf_size filter->frame_buffer_size
 #define ptp_framebuf_to_end_count \
@@ -207,12 +210,14 @@ struct ptp_filter {
     /* For holding submitted urb that is originated from us */
     struct list_head busy_queue;
 
-    unsigned long trans_id;
-    unsigned long trans_id_offset;
+    u32 trans_id;
+    u32 rx_trans_id;
+    struct urb *frame_serving_urb;
 
     struct ptp_state_machine tx;
     struct ptp_state_machine rx;
     struct ptp_state_machine self;
+    struct ptp_state_machine send;
 };
     
 /* Shortcut device info, so that we don't need to intercept
@@ -246,17 +251,20 @@ static unsigned vendors[] = {
     }while(0)
 
 #define ptp_bypass(_reason,...) ptp_bypass_(return(0),flags,_reason,##__VA_ARGS__)
-#define ptp_bypass1(_reason,...) \
+#define ptp_bypass1_(_ret,_reason,...) \
     do{\
         unsigned long _flags;\
         spin_lock_irqsave(&filter->lock,_flags);\
-        ptp_bypass_(return(0),_flags,_reason,##__VA_ARGS__);\
+        ptp_bypass_(_ret,_flags,_reason,##__VA_ARGS__);\
     }while(0)
+#define ptp_bypass1(_reason,...) ptp_bypass1_(return(0),_reason,##__VA_ARGS__)
 #define ptp_bypass2(_reason,...) ptp_bypass_(return,flags,_reason,##__VA_ARGS__)
 #define ptp_bypass3(_reason,...) ptp_bypass_(return(0),*flags,_reason,##__VA_ARGS__)
 
 static void ptp_data_complete(struct urb *urb);
 static void ptp_cmd_complete(struct urb *urb);
+static int ptp_parse(struct ptp_filter *filter, 
+        struct ptp_state_machine *m, struct urb *urb);
 
 static inline void ptp_change_state_(struct ptp_filter *filter, int lock, int state, int line)
 {
@@ -264,10 +272,6 @@ static inline void ptp_change_state_(struct ptp_filter *filter, int lock, int st
 
     if(lock) spin_lock_irqsave(&filter->lock,flags);
 
-    if(state != filter->state) {
-        pr_debug("state change(%d) from %d to %d\n",line,filter->state,state);
-        filter->state = state;
-    }
     if(state < ptpfs_active && filter->state>=ptpfs_active)
         del_timer(&filter->timer);
     else if(state == ptpfs_sleep) {
@@ -277,6 +281,10 @@ static inline void ptp_change_state_(struct ptp_filter *filter, int lock, int st
                 list_move_tail(&priv->list,&filter->free_list);
         }
         del_timer(&filter->timer);
+    }
+    if(state != filter->state) {
+        pr_debug("state change(%d) from %d to %d\n",line,filter->state,state);
+        filter->state = state;
     }
     if(lock) spin_unlock_irqrestore(&filter->lock,flags);
 }
@@ -303,16 +311,20 @@ static void ptp_timer(unsigned long ctx) {
 
     spin_lock_irqsave(&filter->lock,flags);
 
-    if(filter->state < ptpfs_active) {
+    if(filter->state < ptpfs_active ||
+        filter->state == ptpfs_drop ||
+        filter->state == ptpfs_sleep ||
+        filter->state == ptpfs_sleep_wait) 
+    {
         spin_unlock_irqrestore(&filter->lock,flags);
-        pr_debug("timer wakup in state %d\n",filter->state);
+        pr_debug("timer abort in state %d\n",filter->state);
         return;
     }
 
     priv = list_first_entry_or_null(&filter->free_list,struct stub_priv,list);
 
     if(priv == NULL) 
-        pr_debug("no request\n");
+        pr_debug("no free urb\n");
     else {
         pr_debug("timer %lu,%lu\n",jiffies,filter->trigger.jiffies);
         urb = priv->urb;
@@ -320,10 +332,10 @@ static void ptp_timer(unsigned long ctx) {
         urb->transfer_buffer = filter->trigger.ptpdu;
         urb->transfer_buffer_length = le32_to_cpu(filter->trigger.ptpdu->length);
         urb->pipe = filter->out_pipe;
-        list_move_tail(&priv->list,&filter->busy_queue);
 
         filter->trigger.jiffies += frame_jiffies;
 
+        list_move_tail(&priv->list,&filter->busy_queue);
         ptp_produce(filter,&flags,priv);
     }
     spin_unlock_irqrestore(&filter->lock,flags);
@@ -394,6 +406,7 @@ static int ptp_produce_(struct ptp_filter *filter,
         unsigned long *flags,
         struct stub_priv *priv) 
 {
+    int next = ptpfs_idle;
     int head = filter->frame_head, tail=filter->frame_tail;
     struct urb *urb;
     int pending;
@@ -413,18 +426,15 @@ static int ptp_produce_(struct ptp_filter *filter,
             pr_debug("preview\n");
             if(filter->state == ptpfs_sleep)
                 ptp_change_state(filter,0,ptpfs_active);
-            if(filter->state!=ptpfs_active || ptp_framebuf_nospace) {
-                pr_debug("pending in state %d\n",filter->state);
+            else if(filter->state!=ptpfs_active || ptp_framebuf_nospace) {
+                pr_debug("preview pending in state %d\n",filter->state);
                 if(!pending) ptp_list_move(&priv->list,&filter->request_queue);
                 return 0;
             }
             if(filter->frame_rx_tail > 0)
                 filter->frame_rx_tail2 = filter->frame_rx_tail;
             filter->frame_rx_tail = head;
-            filter->trigger.ptpdu->trans_id = cpu_to_le32(++filter->trans_id);
-            ++filter->trans_id_offset;
-            pr_debug("frame request trans id %d\n",le32_to_cpu(filter->trans_id));
-#define ptp_submit_urb_ \
+#define ptp_submit_urb \
             do{\
                 if(pending) {\
                     if(urb->complete != ptp_cmd_complete && urb->complete != ptp_data_complete)\
@@ -435,33 +445,33 @@ static int ptp_produce_(struct ptp_filter *filter,
                 urb->actual_length = 0;\
                 urb->status = 0;\
                 spin_unlock_irqrestore(&filter->lock,*flags);\
-                pr_debug("submit urb %c %p, %u\n",usb_pipeout(urb->pipe)?'>':'<',\
-                        urb,urb->transfer_buffer_length);\
+                pr_debug("submit urb %c %p,%u,%u\n",usb_pipeout(urb->pipe)?'>':'<',\
+                        urb,((u8*)urb->transfer_buffer)-filter->frame_buffer,urb->transfer_buffer_length);\
+                if(usb_pipeout(urb->pipe)) ptp_parse(filter,&filter->send,urb);\
                 stub_submit_urb(filter->sdev,NULL,urb);\
                 spin_lock_irqsave(&filter->lock,*flags);\
                 return 1;\
             }while(0)
-#define ptp_submit_urb(_state) \
-            do{\
-                ptp_change_state(filter,0,_state);\
-                ptp_submit_urb_;\
-            }while(0)
-
-            ptp_submit_urb(ptpfs_busy);
+            next = ptpfs_busy;
+        }else{
+            switch(filter->state) {
+            case ptpfs_idle:
+                next = ptpfs_command;
+                break;
+            case ptpfs_sleep:
+                next = ptpfs_sleep_wait;
+                break;
+            case ptpfs_active:
+                next = ptpfs_wait;
+                break;
+            default:
+                pr_debug("client request pending in state %d\n",filter->state);
+                if(!pending) ptp_list_move(&priv->list,&filter->request_queue);
+                return 1;
+            }
         }
-
-        pr_debug("client request\n");
-        switch(filter->state) {
-        case ptpfs_idle:
-            ptp_submit_urb(ptpfs_command);
-        case ptpfs_sleep:
-            ptp_submit_urb(ptpfs_sleep_wait);
-        case ptpfs_active:
-            ptp_submit_urb(ptpfs_wait);
-        default:
-            pr_debug("client request pending in state %d\n",filter->state);
-            if(!pending) ptp_list_move(&priv->list,&filter->request_queue);
-        }
+        ptp_change_state(filter,0,next);
+        ptp_submit_urb;
         return 1;
     }
     
@@ -476,7 +486,7 @@ static int ptp_produce_(struct ptp_filter *filter,
         if(filter->state != ptpfs_busy && filter->state != ptpfs_drop) {
             pr_debug("client request pass through in state %d\n",filter->state);
             if(!pending) return 0;
-            ptp_submit_urb_;
+            ptp_submit_urb;
         }
         pr_debug("client data request pending in state %d\n",filter->state);
         if(!pending) ptp_list_move(&priv->list,&filter->request_queue);
@@ -543,7 +553,17 @@ static int ptp_produce_(struct ptp_filter *filter,
     if(!urb->transfer_buffer_length)
         ptp_bypass5("bug: transfer_length");
 
-    ptp_submit_urb_;
+    ptp_submit_urb;
+}
+
+static inline int ptp_framebuf_next(struct ptp_filter *filter,
+        int pt, int length)
+{
+    pt = (pt+length)%ptp_framebuf_size;
+    if(pt & ptp_framebuf_align_mask)
+        pt = ((pt>>ptp_framebuf_align_shift)+1)<<
+            ptp_framebuf_align_shift;
+    return pt;
 }
 
 /* caller must hold filter->lock before calling */
@@ -589,7 +609,6 @@ static int ptp_consume_(struct ptp_filter *filter,
                 le16_to_cpu(ptpdu->type)==PTP_USB_CONTAINER_RESPONSE;
             if(urb->actual_length) 
                 ptp_bypass3("unexpected urb length %u",urb->actual_length);
-            ptpdu->trans_id = cpu_to_le32(filter->frame_serving_trans_id);
             filter->frame_length = le32_to_cpu(ptpdu->length);
             if(filter->frame_length < sizeof(*ptpdu))
                 ptp_bypass3("invalid ptpdu length %d",filter->frame_length);
@@ -605,34 +624,41 @@ static int ptp_consume_(struct ptp_filter *filter,
         pr_debug("frame copy %d\n",copy_length);
         memcpy(urb->transfer_buffer+urb->actual_length,
                 filter->frame_buffer+tail,copy_length);
+        memset(filter->frame_buffer+tail,0xff,copy_length);
         filter->frame_length -= copy_length;
         urb->actual_length += copy_length;
 
-        if(filter->frame_length == 0 && filter->frame_pdu_end) {
-            filter->frame_serving = 0;
-            --filter->frame_count;
-            pr_debug("done frame serving %d\n",filter->frame_count);
-        }
-        if(filter->frame_length==0 || 
-                urb->actual_length==urb->transfer_buffer_length) {
-            if(pending) ptp_list_move(&priv->list,&filter->sdev->priv_init);
-            spin_unlock_irqrestore(&filter->lock,*flags);
-#define stub_complete_urb(_u) \
-            do{\
-                pr_debug("stub complete %p\n",_u);\
-                stub_complete(_u);\
-            }while(0)
-            stub_complete_urb(urb);
-            spin_lock_irqsave(&filter->lock,*flags);
-            priv = NULL;
-        }
-
-        tail = (tail + copy_length)%ptp_framebuf_size;
+        tail = (tail+copy_length)%ptp_framebuf_size;
         if(tail < filter->frame_tail) {
             pr_debug("tail roll over\n");
             ptp_framebuf_size = ptp_framebuf_full_size;
         }
+        if(filter->frame_length == 0) {
+            ptp_framebuf_align(tail);
+            if(filter->frame_pdu_end) {
+                filter->frame_serving = 0;
+                --filter->frame_count;
+                pr_debug("done frame serving %d\n",filter->frame_count);
+            }
+        }
         filter->frame_tail = tail;
+
+        if(filter->frame_length==0 || 
+                urb->actual_length==urb->transfer_buffer_length) {
+            if(pending) ptp_list_move(&priv->list,&filter->sdev->priv_init);
+            spin_unlock_irqrestore(&filter->lock,*flags);
+#define ptp_complete_urb(_u) \
+            do{\
+                pr_debug("urb complete %p\n",_u);\
+                filter->frame_serving_urb = _u;\
+                _u->status = 0;\
+                _u->complete(_u);\
+                filter->frame_serving_urb = 0;\
+            }while(0)
+            ptp_complete_urb(urb);
+            spin_lock_irqsave(&filter->lock,*flags);
+            priv = NULL;
+        }
 
         ptp_produce(filter,flags,NULL);
     }
@@ -644,9 +670,6 @@ static int ptp_consume_(struct ptp_filter *filter,
     return ret;
 }
 
-static int ptp_parse(struct ptp_filter *filter, 
-        struct ptp_state_machine *m, struct urb *urb);
-
 static void ptp_data_complete(struct urb *urb) {
     PTPUSBBulkHeader *ptpdu = (PTPUSBBulkHeader*)urb->transfer_buffer;
 	struct stub_priv *priv = (struct stub_priv *) urb->context;
@@ -654,23 +677,29 @@ static void ptp_data_complete(struct urb *urb) {
 	unsigned long flags;
     int head,tail;
 
+    if(urb->status) {
+        unsigned long flags;
+        spin_lock_irqsave(&filter->lock,flags);
+        list_move_tail(&priv->list,&filter->free_list);
+        ptp_bypass2("urb failed %d",urb->status);
+    }
+
     ptp_parse(filter,&filter->self,urb);
 
     spin_lock_irqsave(&filter->lock,flags);
 
     head = filter->frame_head; 
     tail=filter->frame_tail;
-    pr_debug("data complete %p, %u, %d,%d\n",urb,urb->actual_length,head,tail);
+    pr_debug("data complete %p,%u, %u, %d,%d\n",
+            urb,((u8*)urb->transfer_buffer)-filter->frame_buffer,urb->actual_length,head,tail);
 
-    if(urb->status || 
-        (filter->state!=ptpfs_busy && filter->state!=ptpfs_drop)) 
-    {
+    if(filter->state!=ptpfs_busy && filter->state!=ptpfs_drop) {
 #define ptp_bypass4(_msg,...) \
         do{\
             list_move_tail(&priv->list,&filter->free_list);\
             ptp_bypass2(_msg,##__VA_ARGS__);\
         }while(0)
-        ptp_bypass4("urb complete with error %d,%d", urb->status,filter->state);
+        ptp_bypass4("invalid state %d,%d", urb->status,filter->state);
     }
 
     if(filter->frame_rx_length == 0) {
@@ -683,42 +712,41 @@ static void ptp_data_complete(struct urb *urb) {
             le16_to_cpu(ptpdu->type)==PTP_USB_CONTAINER_RESPONSE;
     }
     filter->frame_rx_length -= urb->actual_length;
-
-    if(filter->state != ptpfs_drop) {
+    if(filter->state != ptpfs_drop)
         head = (head+urb->actual_length)%ptp_framebuf_size;
-        filter->frame_head = head;
-        ptp_consume(filter,&flags,NULL);
-    }
 
-    if(filter->frame_rx_length == 0 && filter->frame_rx_pdu_end) {
-        list_move_tail(&priv->list,&filter->free_list);
-        priv = NULL;
+    if(filter->frame_rx_length == 0) {
+        ptp_framebuf_align(head);
 
-        if(filter->state == ptpfs_drop) {
-            head = filter->frame_head = filter->frame_rx_tail;
-            if(head >= tail) 
-                ptp_framebuf_size = ptp_framebuf_full_size;
-            ptp_change_state(filter,0,ptpfs_sleep);
-        }else if(++filter->frame_count >= usbip_ptp_buffer_count){
-            pr_debug("max buffer count reached, sleep\n");
-            ptp_change_state(filter,0,ptpfs_sleep);
-        } else {
-            if(filter->self.ptpdu.code != PTP_RC_OK){
-                pr_debug("frame done with error %u, %d\n",
-                        filter->tx.ptpdu.code,filter->frame_count);
+        if(filter->frame_rx_pdu_end) {
+            list_move_tail(&priv->list,&filter->free_list);
+            priv = NULL;
+            if(filter->state == ptpfs_drop) {
+                head = filter->frame_rx_tail;
+                if(head >= tail) 
+                    ptp_framebuf_size = ptp_framebuf_full_size;
                 ptp_change_state(filter,0,ptpfs_sleep);
-            }else{
-                pr_debug("frame done %d\n",filter->frame_count);
-                ptp_change_state(filter,0,ptpfs_active);
-                if(filter->trigger.jiffies < jiffies) 
-                    filter->trigger.jiffies = jiffies + 1;
-                mod_timer(&filter->timer, filter->trigger.jiffies);
+            }else if(++filter->frame_count >= usbip_ptp_buffer_count){
+                pr_debug("max buffer count reached %d, sleep\n",filter->frame_count);
+                ptp_change_state(filter,0,ptpfs_sleep);
+            } else {
+                if(filter->self.ptpdu.code != PTP_RC_OK){
+                    pr_debug("frame done with error %04x, %d\n",
+                            filter->self.ptpdu.code,filter->frame_count);
+                    ptp_change_state(filter,0,ptpfs_sleep);
+                }else{
+                    pr_debug("frame done %d\n",filter->frame_count);
+                    ptp_change_state(filter,0,ptpfs_active);
+                    if(filter->trigger.jiffies < jiffies) 
+                        filter->trigger.jiffies = jiffies + 1;
+                    mod_timer(&filter->timer, filter->trigger.jiffies);
+                }
             }
         }
     }
-
+    filter->frame_head = head;
     ptp_produce(filter,&flags,priv);
-
+    ptp_consume(filter,&flags,NULL);
     spin_unlock_irqrestore(&filter->lock,flags);
 }
 
@@ -728,7 +756,8 @@ static void ptp_cmd_complete(struct urb *urb) {
 	unsigned long flags;
     int head,tail;
 
-    pr_debug("ptp cmd complete %p, %u\n",urb,urb->actual_length);
+    pr_debug("ptp cmd complete %p,%u,%u\n",
+            urb,((u8*)urb->transfer_buffer)-filter->frame_buffer,urb->actual_length);
 
     spin_lock_irqsave(&filter->lock,flags);
     head = filter->frame_head; 
@@ -746,7 +775,8 @@ static void ptp_cmd_complete(struct urb *urb) {
     if(!urb->transfer_buffer_length)
         ptp_bypass2("bug: invalid transfer length");
     spin_unlock_irqrestore(&filter->lock,flags);
-    pr_debug("submit urb %p, %u\n",urb,urb->transfer_buffer_length);
+    pr_debug("submit urb %p,%u, %u\n",
+            urb,((u8*)urb->transfer_buffer)-filter->frame_buffer,urb->transfer_buffer_length);
     stub_submit_urb(filter->sdev,NULL,urb);
     return;
 }
@@ -764,23 +794,19 @@ static int ptp_check_preview(struct ptp_filter *filter, struct urb *urb) {
     return 0;
 }
 
-static inline u32 ptp_correct_trans_id(struct ptp_filter *filter,
-        struct ptp_state_machine *m, u32 trans_id)
+static inline void ptp_check_new_session(struct ptp_filter *filter,
+        struct ptp_state_machine *m)
 {
-    if(m == &filter->rx)
-        return le32_to_cpu(trans_id)+ filter->trans_id_offset;
-    else
-        return le32_to_cpu(trans_id)- filter->trans_id_offset;
-}
-
-static inline void ptp_read_header(struct ptp_filter *filter,
-        struct ptp_state_machine *m, void *data) 
-{
-    PTPUSBBulkContainer *ptpdu = (PTPUSBBulkContainer *)data;
-    m->ptpdu.length = le32_to_cpu(ptpdu->length);
-    m->ptpdu.type = le16_to_cpu(ptpdu->type);
-    m->ptpdu.code = le16_to_cpu(ptpdu->code);
-    m->ptpdu.trans_id = ptp_correct_trans_id(filter,m,ptpdu->trans_id);
+    unsigned long flags;
+    if(m!=&filter->rx) return;
+    if(m->ptpdu.type==PTP_USB_CONTAINER_COMMAND) {
+        if(m->ptpdu.code==PTP_OC_OpenSession || m->ptpdu.code==PTP_OC_CloseSession) {
+            spin_lock_irqsave(&filter->lock,flags);
+            if(m->ptpdu.code == PTP_OC_OpenSession) filter->trans_id = 0;
+            pr_debug("session change %u\n",m->ptpdu.code);
+            ptp_change_state(filter,0,ptpfs_idle);
+        }
+    }
 }
 
 static int ptp_parse(struct ptp_filter *filter, 
@@ -795,64 +821,56 @@ static int ptp_parse(struct ptp_filter *filter,
      * transaction id correction for both tx and rx
      */
     while(length) {
+        PTPUSBBulkHeader *ptpdu = (PTPUSBBulkHeader *)data;
         switch(m->state) {
         case ptpps_wait_response:
         case ptpps_none:
-            /* By right, ptp pdu header shall never span multiple
-             * urb, just be paranoid here.  
-             *
-             * See below for the reason of this init trans_id */
-            m->ptpdu.trans_id = 0xffffffff;
-            m->state = ptpps_header;
-            if(length >= sizeof(PTPUSBBulkHeader)) {
-                PTPUSBBulkHeader *ptpdu = (PTPUSBBulkHeader *)data;
-                ptp_read_header(filter,m,data);
-                ptpdu->trans_id = cpu_to_le32(m->ptpdu.trans_id);
-                length -= sizeof(PTPUSBBulkHeader);
-                data += sizeof(PTPUSBBulkHeader);
-                m->size = sizeof(PTPUSBBulkHeader);
-            }else
-                m->size = 0;
-            /* fall through */
-        case ptpps_header:
-            if(m->size < sizeof(PTPUSBBulkHeader)) {
-                union {
-                    u32 id;
-                    u8 bytes[4];
-                } trans;
-                u8 *dst = (u8*)&m->ptpdu;
-                unsigned copy_length = m->size+length>sizeof(PTPUSBBulkHeader)?
-                    sizeof(PTPUSBBulkHeader)-m->size:length;
-                memcpy(dst+m->size,data,copy_length);
-                if(m->size + copy_length > offsetof(PTPUSBBulkHeader,trans_id)) {
-                    /* Although highly unlikely, the trans_id field may be broken in
-                     * the middle by bulk transfer. Thankfully, ptp standard uses little
-                     * endian, we don't have to wait for all the bytes before correcting
-                     * the trans_id. And because sending back the trans_id requires substracting
-                     * the offset, we initialize the trans_id as 0xffffffff in previous state,
-                     */
-                    unsigned offset = offsetof(PTPUSBBulkHeader,trans_id);
-                    if(m->size < offset) 
-                        offset -= m->size;
-                    else
-                        offset = 0;
-                    trans.id = cpu_to_le32(ptp_correct_trans_id(filter,m,m->ptpdu.trans_id));
-                    pr_debug("ptp trans_id fix %u,%u,%u",m->size,copy_length,offset);
-                    memcpy(data+offset,trans.bytes+m->size+offset-offsetof(PTPUSBBulkHeader,trans_id),
-                            copy_length-offset);
-                }
-                m->size += copy_length;
-                length -= copy_length;
-                data += copy_length;
-
-                if(m->size < sizeof(PTPUSBBulkHeader)) break;
-                ptp_read_header(filter,m,&m->ptpdu);
+            if(length < sizeof(PTPUSBBulkHeader)) {
+                /* We cannot handle cases where the header is broken half
+                 * by the bulk transfer. We need to add another state
+                 * to handle this. It is complicated since we need to modify
+                 * the trans_id. It seems to be illeagle to contain more
+                 * than one ptp pdu inside one bulk transfer. So we may be
+                 * fine here.
+                 */
+                ptp_bypass1("%s %p invalid size%u",m->type,urb,length);
             }
-            pr_debug("ptp phase %u, code %04x, length %u, tid %lu\n",
+            pr_debug(" %s header: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                    m->type, data[0], data[1], data[2], data[3], data[4], data[5], data[6],
+                    data[7], data[8], data[9], data[10], data[11]);
+            m->ptpdu.length = le32_to_cpu(ptpdu->length);
+            m->ptpdu.type = le16_to_cpu(ptpdu->type);
+            m->ptpdu.code = le16_to_cpu(ptpdu->code);
+            m->ptpdu.trans_id = le32_to_cpu(ptpdu->trans_id);
+            ptp_check_new_session(filter,m);
+            if(m==&filter->rx) {
+                /* backup the original trans id here */
+                filter->rx_trans_id = ptpdu->trans_id;
+                /* rewrite with the current trans id in case we'll
+                 * send this urb immediately */
+                ptpdu->trans_id = cpu_to_le32(filter->trans_id);
+            }else if(m==&filter->tx) {
+                /* restore the trans id before returning back to
+                 * the client */
+                ptpdu->trans_id = filter->rx_trans_id;
+            }else if(m==&filter->send){
+                /* we may delay the urb because we are in the middle of an
+                 * transaction (remember, we are secretly sending preview
+                 * request). So rewrite with the current trans id before
+                 * actually submiting the urb */
+                ptpdu->trans_id = cpu_to_le32(filter->trans_id);
+            }
+            length -= sizeof(PTPUSBBulkHeader);
+            data += sizeof(PTPUSBBulkHeader);
+            m->size = sizeof(PTPUSBBulkHeader);
+            pr_debug("%s %p phase %u, code %04x, length %u, tid %u,%u\n",
+                    m->type,
+                    urb,
                     m->ptpdu.type,
                     m->ptpdu.code,
                     m->ptpdu.length,
-                    m->ptpdu.trans_id+(m==&filter->tx?filter->trans_id_offset:0));
+                    m->ptpdu.trans_id,
+                    le32_to_cpu(ptpdu->trans_id));
             switch(m->ptpdu.type) {
             case PTP_USB_CONTAINER_COMMAND:
                 m->state = ptpps_command;
@@ -865,6 +883,7 @@ static int ptp_parse(struct ptp_filter *filter,
                 break;
             default:
                 m->state = ptpps_unkonwn;
+                ptp_bypass1("%s %p unknown code %u",m->type,urb,m->ptpdu.code);
             }
             /* fall through */
         default:
@@ -872,15 +891,18 @@ static int ptp_parse(struct ptp_filter *filter,
                 m->size += length;
                 /* TODO check ptp pdu code and buffer for get_device_info ?  */
                 length = 0;
-                pr_debug("ptp phase pending, need %u\n",m->ptpdu.length-m->size);
+                pr_debug("%s phase pending, need %u\n",m->type,m->ptpdu.length-m->size);
             }else {
                 unsigned offset = m->ptpdu.length - m->size;
                 length -= offset;
                 data += offset;
-                pr_debug("ptp phase done\n");
                 if(m->state == ptpps_response) {
                     m->state = ptpps_none;
                     done = 1;
+                    if(m!=&filter->rx && urb!=filter->frame_serving_urb){
+                        ++filter->trans_id;
+                        pr_debug("%s increase tid %u",m->type,filter->trans_id);
+                    }
                 }else
                     m->state = ptpps_wait_response;
             }
@@ -904,6 +926,10 @@ static int ptp_on_tx(struct usbip_filter *ufilter,
         ptp_bypass1("urb failed %d",urb->status);
        
     done = ptp_parse(filter,&filter->tx,urb);
+
+#ifdef TRACE_STREAM
+    return 0;
+#endif
 
     if(usb_pipeout(urb->pipe)) 
         return 0;
@@ -981,6 +1007,9 @@ static int ptp_on_rx(struct usbip_filter *ufilter,
     }
 
     ptp_parse(filter,&filter->rx,urb);
+#ifdef TRACE_STREAM
+    return 0;
+#endif
 
     if(filter->rx.state != ptpps_wait_response ||
         filter->rx.ptpdu.type != PTP_USB_CONTAINER_COMMAND)
@@ -989,8 +1018,6 @@ static int ptp_on_rx(struct usbip_filter *ufilter,
     spin_lock_irqsave(&filter->lock,flags);
 
     ptpdu = (PTPUSBBulkContainer *)urb->transfer_buffer;
-
-    filter->trans_id = filter->rx.ptpdu.trans_id;
 
     if(ptp_check_preview(filter,urb)) {
         switch(filter->state) {
@@ -1007,30 +1034,28 @@ static int ptp_on_rx(struct usbip_filter *ufilter,
             /* fall through */
         case ptpfs_sleep:
             filter->frame_serving = 1;
-            filter->frame_serving_trans_id = filter->trans_id - filter->trans_id_offset;
             ptp_change_state(filter,0,ptpfs_active);
 
-            urb->status = 0;
             urb->actual_length = urb->transfer_buffer_length;
 
             if(filter->frame_count && filter->trigger.jiffies>jiffies) {
                 mod_timer(&filter->timer, filter->trigger.jiffies);
                 spin_unlock_irqrestore(&filter->lock,flags);
-                stub_complete_urb(urb);
+                ptp_complete_urb(urb);
                 return 1;
             }
 
             filter->trigger.jiffies = jiffies;
-            --filter->trans_id;
             spin_unlock_irqrestore(&filter->lock,flags);
 
-            stub_complete_urb(urb);
+            ptp_complete_urb(urb);
 
             if(!filter->frame_buffer) {
                 int i;
                 filter->frame_buffer = kmalloc(ptp_framebuf_full_size,GFP_KERNEL);
                 if(filter->frame_buffer == NULL) 
                     ptp_bypass1("kmalloc error");
+                memset(filter->frame_buffer,0xfd,ptp_framebuf_full_size);
                 filter->frame_buffer_size = ptp_framebuf_full_size;
 
                 if(urb->transfer_buffer_length != le32_to_cpu(ptpdu->length)) 
@@ -1058,15 +1083,14 @@ static int ptp_on_rx(struct usbip_filter *ufilter,
                     ptp_bypass("multiple frame serving");
                 pr_debug("frame serving in state %d\n",filter->state);
                 filter->frame_serving = 1;
-                filter->frame_serving_trans_id = filter->trans_id - filter->trans_id_offset;
-                --filter->trans_id_offset;
                 spin_unlock_irqrestore(&filter->lock,flags);
-                stub_complete_urb(urb);
+                urb->actual_length = urb->transfer_buffer_length;
+                ptp_complete_urb(urb);
                 return 1;
             } 
             ptp_bypass("preview command in invalid state %d",filter->state);
         }
-    }else { 
+    }else{
         switch(filter->state) {
         case ptpfs_active:
             ptp_change_state(filter,0,ptpfs_wait);
@@ -1136,6 +1160,10 @@ static void *ptp_probe(struct usbip_device *ud,
     INIT_LIST_HEAD(&filter->request_queue);
     INIT_LIST_HEAD(&filter->free_list);
     INIT_LIST_HEAD(&filter->busy_queue);
+    filter->rx.type = "rx";
+    filter->tx.type = "tx";
+    filter->self.type = "self";
+    filter->send.type = "send";
     filter->sdev = container_of(ud, struct stub_device, ud);
     setup_timer(&filter->timer,ptp_timer,(unsigned long)filter);
 
