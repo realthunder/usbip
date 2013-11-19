@@ -30,7 +30,7 @@
 #include <linux/usb.h>
 #include <linux/wait.h>
 
-#define USBIP_VERSION "1.0.0"
+#define USBIP_VERSION USBIP_VERSION_STRING
 
 #undef pr_fmt
 
@@ -103,132 +103,7 @@ extern struct device_attribute dev_attr_usbip_debug;
 #define usbip_dbg_stub_tx(fmt, args...) \
 	usbip_dbg_with_flag(usbip_debug_stub_tx, fmt , ##args)
 
-/*
- * USB/IP request headers
- *
- * Each request is transferred across the network to its counterpart, which
- * facilitates the normal USB communication. The values contained in the headers
- * are basically the same as in a URB. Currently, four request types are
- * defined:
- *
- *  - USBIP_CMD_SUBMIT: a USB request block, corresponds to usb_submit_urb()
- *    (client to server)
- *
- *  - USBIP_RET_SUBMIT: the result of USBIP_CMD_SUBMIT
- *    (server to client)
- *
- *  - USBIP_CMD_UNLINK: an unlink request of a pending USBIP_CMD_SUBMIT,
- *    corresponds to usb_unlink_urb()
- *    (client to server)
- *
- *  - USBIP_RET_UNLINK: the result of USBIP_CMD_UNLINK
- *    (server to client)
- *
- */
-#define USBIP_CMD_SUBMIT	0x0001
-#define USBIP_CMD_UNLINK	0x0002
-#define USBIP_RET_SUBMIT	0x0003
-#define USBIP_RET_UNLINK	0x0004
-
-#define USBIP_DIR_OUT	0x00
-#define USBIP_DIR_IN	0x01
-
-/**
- * struct usbip_header_basic - data pertinent to every request
- * @command: the usbip request type
- * @seqnum: sequential number that identifies requests; incremented per
- *	    connection
- * @devid: specifies a remote USB device uniquely instead of busnum and devnum;
- *	   in the stub driver, this value is ((busnum << 16) | devnum)
- * @direction: direction of the transfer
- * @ep: endpoint number
- */
-struct usbip_header_basic {
-	__u32 command;
-	__u32 seqnum;
-	__u32 devid;
-	__u32 direction;
-	__u32 ep;
-} __packed;
-
-/**
- * struct usbip_header_cmd_submit - USBIP_CMD_SUBMIT packet header
- * @transfer_flags: URB flags
- * @transfer_buffer_length: the data size for (in) or (out) transfer
- * @start_frame: initial frame for isochronous or interrupt transfers
- * @number_of_packets: number of isochronous packets
- * @interval: maximum time for the request on the server-side host controller
- * @setup: setup data for a control request
- */
-struct usbip_header_cmd_submit {
-	__u32 transfer_flags;
-	__s32 transfer_buffer_length;
-
-	/* it is difficult for usbip to sync frames (reserved only?) */
-	__s32 start_frame;
-	__s32 number_of_packets;
-	__s32 interval;
-
-	unsigned char setup[8];
-} __packed;
-
-/**
- * struct usbip_header_ret_submit - USBIP_RET_SUBMIT packet header
- * @status: return status of a non-iso request
- * @actual_length: number of bytes transferred
- * @start_frame: initial frame for isochronous or interrupt transfers
- * @number_of_packets: number of isochronous packets
- * @error_count: number of errors for isochronous transfers
- */
-struct usbip_header_ret_submit {
-	__s32 status;
-	__s32 actual_length;
-	__s32 start_frame;
-	__s32 number_of_packets;
-	__s32 error_count;
-} __packed;
-
-/**
- * struct usbip_header_cmd_unlink - USBIP_CMD_UNLINK packet header
- * @seqnum: the URB seqnum to unlink
- */
-struct usbip_header_cmd_unlink {
-	__u32 seqnum;
-} __packed;
-
-/**
- * struct usbip_header_ret_unlink - USBIP_RET_UNLINK packet header
- * @status: return status of the request
- */
-struct usbip_header_ret_unlink {
-	__s32 status;
-} __packed;
-
-/**
- * struct usbip_header - common header for all usbip packets
- * @base: the basic header
- * @u: packet type dependent header
- */
-struct usbip_header {
-	struct usbip_header_basic base;
-
-	union {
-		struct usbip_header_cmd_submit	cmd_submit;
-		struct usbip_header_ret_submit	ret_submit;
-		struct usbip_header_cmd_unlink	cmd_unlink;
-		struct usbip_header_ret_unlink	ret_unlink;
-	} u;
-} __packed;
-
-/*
- * This is the same as usb_iso_packet_descriptor but packed for pdu.
- */
-struct usbip_iso_packet_descriptor {
-	__u32 offset;
-	__u32 length;			/* expected length */
-	__u32 actual_length;
-	__u32 status;
-} __packed;
+#include "usbip_struct.h"
 
 enum usbip_side {
 	USBIP_VHCI,

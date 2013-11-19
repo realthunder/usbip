@@ -27,6 +27,7 @@
 #define USBIP_CORE_MOD_NAME	"usbip-core"
 #define USBIP_HOST_DRV_NAME	"usbip-host"
 #define USBIP_VHCI_DRV_NAME	"vhci_hcd"
+#include "usbip_struct.h"
 
 extern int usbip_use_syslog;
 extern int usbip_use_stderr;
@@ -99,33 +100,6 @@ enum usbip_device_status {
 	VDEV_ST_USED,
 	VDEV_ST_ERROR
 };
-
-struct usbip_usb_interface {
-	uint8_t bInterfaceClass;
-	uint8_t bInterfaceSubClass;
-	uint8_t bInterfaceProtocol;
-	uint8_t padding;	/* alignment */
-} __attribute__((packed));
-
-struct usbip_usb_device {
-	char path[SYSFS_PATH_MAX];
-	char busid[SYSFS_BUS_ID_SIZE];
-
-	uint32_t busnum;
-	uint32_t devnum;
-	uint32_t speed;
-
-	uint16_t idVendor;
-	uint16_t idProduct;
-	uint16_t bcdDevice;
-
-	uint8_t bDeviceClass;
-	uint8_t bDeviceSubClass;
-	uint8_t bDeviceProtocol;
-	uint8_t bConfigurationValue;
-	uint8_t bNumConfigurations;
-	uint8_t bNumInterfaces;
-} __attribute__((packed));
 
 #define to_string(s)	#s
 

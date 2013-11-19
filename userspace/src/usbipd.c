@@ -507,6 +507,24 @@ static int do_standalone_mode(int daemonize)
 
 	return 0;
 }
+struct usbip_usb_device2 {
+    char path[SYSFS_PATH_MAX];
+    char busid[SYSFS_BUS_ID_SIZE];
+    uint32_t busnum;
+    uint32_t devnum;
+    uint32_t speed;
+
+    uint16_t idVendor;
+    uint16_t idProduct;
+    uint16_t bcdDevice;
+
+    uint8_t bDeviceClass;
+    uint8_t bDeviceSubClass;
+    uint8_t bDeviceProtocol;
+    uint8_t bConfigurationValue;
+    uint8_t bNumConfigurations;
+    uint8_t bNumInterfaces;
+} __attribute__((packed));
 
 int main(int argc, char *argv[])
 {
@@ -526,6 +544,8 @@ int main(int argc, char *argv[])
 
 	int daemonize = 0;
 	int opt, rc = -1;
+
+    printf("%u, %u, %u, %u",sizeof(struct usbip_usb_device),sizeof(usbip_usb_device2), SYSFS_PATH_MAX,SYSFS_BUS_ID_SIZE);
 
 	usbip_use_stderr = 1;
 	usbip_use_syslog = 0;
