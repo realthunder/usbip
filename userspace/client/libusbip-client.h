@@ -62,8 +62,14 @@ typedef struct libusbip_device_info_s {
     libusbip_device_interface_t *interfaces;
 }libusbip_device_info_t;
 
-LIBUSBIP_EXTERN int libusbip_init(libusbip_session_t **session);
+LIBUSBIP_EXTERN int libusbip_init(libusbip_session_t **session, int level);
 LIBUSBIP_EXTERN void libusbip_exit(libusbip_session_t *session);
+
+#define LIBUSBIP_LOG_NONE 0
+#define LIBUSBIP_LOG_ERROR 1
+#define LIBUSBIP_LOG_DEBUG 2
+#define LIBUSBIP_LOG_TRACE 3
+LIBUSBIP_EXTERN void libusbip_set_debug(libusbip_session_t *session, int level);
 
 LIBUSBIP_EXTERN void libusbip_add_hosts(libusbip_session_t *session, 
         libusbip_host_t *hosts, unsigned count);
@@ -81,7 +87,7 @@ LIBUSBIP_EXTERN void libusbip_free_devices_info(libusbip_session_t *session,
 
 LIBUSBIP_EXTERN int libusbip_device_open(libusbip_session_t *session,
         libusbip_device_t **dev, const char *addr, int port, 
-        const char *devid, int timeout, libusbip_job_t *job);
+        const char *devid, int retry, int timeout, libusbip_job_t *job);
 LIBUSBIP_EXTERN libusbip_device_t *libusbip_device_cast(
         libusbip_session_t *session, void *pt);
 

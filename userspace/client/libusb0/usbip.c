@@ -217,7 +217,6 @@ static inline const char *get_hostname(struct usb_bus *bus)
 struct usb_dev_handle *usb_os_open(struct usb_device *udev) {
     int ret;
     libusbip_device_t *dev = NULL;
-    int busnum,devnum;
     usb_dev_handle *handle;
 
     if(hook.func_usb_open) {
@@ -244,7 +243,7 @@ struct usb_dev_handle *usb_os_open(struct usb_device *udev) {
 
     ret = libusbip_device_open(session,&dev,
             get_hostname(handle->bus),handle->bus->location,
-            handle->device->filename,5000,0);
+            handle->device->filename,3,5000,0);
     if(ret) goto ON_ERROR;
     handle->impl_info = dev;
     return handle;
@@ -436,7 +435,9 @@ int usb_os_find_devices(struct usb_bus *bus, struct usb_device **devices)
     for(i=0;i<count;++i) {
         dev = (struct usb_device*)calloc(1,sizeof(struct usb_device));
         dev->bus = bus;
-        strncpy(dev->filename,info[i].busid,sizeof(dev->filename));
+        snprintf(dev->filename,sizeof(dev->filename),"%d-%d:%s",
+                info[i].busnum,info[i].devnum,info[i].busid);
+        dev->devnum = info[i].devnum;
         dev->descriptor.bDescriptorType = USB_DT_DEVICE;
         dev->descriptor.bcdUSB = info[i].bcdDevice;
         dev->descriptor.bDeviceClass = info[i].bDeviceClass;
@@ -475,7 +476,7 @@ void usb_os_init(void)
     hooklib();
     if(hook.func_usb_os_init) 
         hook.func_usb_os_init();
-    libusbip_init(&session);
+    libusbip_init(&session,1);
 }
 
 int usb_resetep(usb_dev_handle *handle, unsigned int ep)
@@ -523,6 +524,7 @@ int usb_detach_kernel_driver_np(usb_dev_handle *handle, int interface)
 void usb_set_debug(int level) {
     if(hook.func_usb_set_debug)
         hook.func_usb_set_debug(level);
+    libusbip_set_debug(session,level);
     return usb_os_set_debug(level);
 }
 

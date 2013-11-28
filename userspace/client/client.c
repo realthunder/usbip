@@ -59,21 +59,52 @@
 #define host_t libusbip_host_t
 #define job_t libusbip_job_t
 
+#undef log
 #undef err
-#undef dbg
-#define err(msg,...) fprintf(stderr,"err %s(%d) - " msg "\n",__func__,__LINE__,##__VA_ARGS__)
-#define dbg(msg,...) fprintf(stderr,"dbg %s(%d) - " msg "\n",__func__,__LINE__,##__VA_ARGS__)
-#define work_dbg_(_work,msg,...) dbg("%s(%p): " msg, _work->cb_name,_work->data,##__VA_ARGS__)
-#define work_dbg(msg,...) work_dbg_(work,msg,##__VA_ARGS__)
-#define work_trace dbg("%s(%p)", work->cb_name,work->data)
-#define device_dbg(msg,...) dbg("device(%p): " msg, dev,##__VA_ARGS__)
-#define device_trace dbg("device(%p)",dev)
+
+static const char *log_level[] = {
+    "none",
+    "error",
+    "debug",
+    "trace",
+};
+
+#ifdef LIBUSBIP_NO_DEBUG
+#   define log(_l,msg,...) do{}while(0)
+#else
+#   define log(_l,msg,...) do{\
+        if(LIBUSBIP_LOG_##_l>=session->log_level) break;\
+        if(session->log_level < LIBUSBIP_LOG_DEBUG)\
+            fprintf(stderr,msg "\n",##__VA_ARGS__);\
+        else {\
+            char _tmp[128];\
+            session_time(session,_tmp,sizeof(_tmp));\
+            fprintf(stderr,"%s:%d:1 %s %s - %s:" msg "\n", \
+                    __FILE__,__LINE__,_tmp,__func__,log_level[LIBUSBIP_LOG_##_l],##__VA_ARGS__);\
+        }\
+    }while(0)
+#endif
+
+#define err(msg,...) log(ERROR,msg,##__VA_ARGS__)
+#define err_uv(_ret,msg,...) do{\
+    uv_err_t err = uv_last_error(session->loop);\
+    err("uv error: %d, %d,%s,%s - " msg, _ret,\
+            err.code,uv_err_name(err),uv_strerror(err), ##__VA_ARGS__);\
+}while(0)
+#define work_log(_log,_work,msg,...) log(_log,"%s(%p): " msg, (_work)->cb_name,(_work)->data,##__VA_ARGS__)
+#define work_dbg(msg,...) work_log(DEBUG,work,msg,##__VA_ARGS__)
+#define work_trace(msg,...) work_log(TRACE,work,msg,##__VA_ARGS__)
+#define device_log(_log,_dev,msg,...) log(_log,"device(%p): " msg, _dev,##__VA_ARGS__)
+#define device_dbg(msg,...) device_log(DEBUG,dev,msg,##__VA_ARGS__)
+#define device_trace(msg,...) device_log(TRACE,dev,msg,##__VA_ARGS__)
+#define device_info_req_log(_log,_req,msg,...) log(_log,msg,##__VA_ARGS__)
 
 enum device_state_t {
     devs_closed = 0,
-    devs_opening = 1,
-    devs_running = 2,
-    devs_closing = 3,
+    devs_closing = 1,
+    devs_restarting = 2,
+    devs_opening = 3,
+    devs_running = 4,
 };
 
 USBIP_STRUCT_BEGIN(usb_ctrlrequest_s)
@@ -101,13 +132,13 @@ typedef struct urb_s {
 #define obj_ref(_name,_obj) \
     do {\
         ++(_obj)->ref_count;\
-        _name##_dbg(#_name " ref %d",(_obj)->ref_count);\
+        _name##_log(TRACE,_obj,#_name " ref %d",(_obj)->ref_count);\
     }while(0)
 
 #define obj_unref(_name,_obj) \
     do {\
         --(_obj)->ref_count;\
-        _name##_dbg(#_name " unref %d",(_obj)->ref_count);\
+        _name##_log(TRACE,_obj,#_name " unref %d",(_obj)->ref_count);\
         assert((_obj)->ref_count>=0);\
         if((_obj)->ref_count == 0)\
             _name##_del(_obj);\
@@ -115,6 +146,7 @@ typedef struct urb_s {
 
 struct device_s { 
     SLIST_ENTRY(device_s) node;
+    struct device_s **pdev;
     session_t *session;
     uv_tcp_t socket;
     struct sockaddr_in addr;
@@ -123,6 +155,8 @@ struct device_s {
     struct pt pt;
     int ref_count;
     int state;
+    int max_retry;
+    uv_timer_t timer;
     union {
         struct {
             uv_write_t req_write;
@@ -130,6 +164,7 @@ struct device_s {
             struct op_common op_header;
             struct op_import_request req_import;
             struct op_import_reply rpl_import;
+            int retry;
         }connect;
         struct {
             struct usbip_header header;
@@ -139,6 +174,7 @@ struct device_s {
     };
 
     TAILQ_HEAD(urb_list_s, urb_s) urb_list;
+    TAILQ_HEAD(read_list_s, work_s) read_list;
 };
 #define device_ref(_dev) obj_ref(device,_dev)
 #define device_unref(_dev) obj_unref(device,_dev)
@@ -163,7 +199,6 @@ enum work_state_t {
     ws_pending,
     ws_busy,
     ws_done,
-    ws_aborting,
 };
 
 typedef struct work_s work_t;
@@ -191,15 +226,61 @@ struct work_s {
         ssize_t nread;
     };
     uv_buf_t buf;
+    int reading;
 
     callback_t user_cb;
     void *user_data;
 };
-#define work_ref(_work) obj_ref(work,_work)
-#define work_unref(_work) obj_unref(work,_work)
+
+typedef struct host_node_s {
+    LIST_ENTRY(host_node_s) node;
+    host_t host;
+}host_node_t;
+
+typedef struct session_s {
+    uv_thread_t thread;
+    uv_loop_t *loop;
+    uv_async_t notify;
+    int active;
+    int log_level;
+    uint64_t start_time;
+
+    uv_mutex_t work_mutex;
+    TAILQ_HEAD(work_queue_s, work_s) work_queue;
+
+    uv_mutex_t mem_mutex;
+    SLIST_HEAD(device_blocks_s,device_block_s) device_blocks;
+    SLIST_HEAD(free_sync_list_s,sync_s) free_sync_list;
+    SLIST_HEAD(free_device_list_s, device_s) free_device_list;
+    TAILQ_HEAD(free_urb_list_s, urb_s) free_urb_list;
+    TAILQ_HEAD(free_work_list_s, work_s) free_work_list;
+
+    LIST_HEAD(host_list_s,host_node_s) host_list;
+    size_t host_count;
+}session_t;
+
+static void session_time(session_t *session, char *buf, size_t len) {
+    buf[len-1] = 0;
+    if(session->loop) {
+        unsigned _t = uv_now(session->loop) - session->start_time;
+        snprintf(buf,len-1,"%02u:%02u.%02u",_t/1000/60,_t/1000%60,_t%1000);
+    }else
+        buf[0] = 0;
+}
+
+static void close_cb(uv_handle_t *handle) {
+    work_t *work = (work_t*)handle->data;
+    work->cb(work,wa_process);
+}
+
+static void timer_cb(uv_timer_t *timer, int status) {
+    work_t *work = (work_t*)timer->data;
+    if(!status) work->cb(work,wa_process);
+}
 
 static uv_buf_t alloc_cb(uv_handle_t *handle, size_t suggested_size) {
     work_t *work = (work_t*)handle->data;
+    session_t *session = work->session;
     work_dbg("alloc cb %d,%u",work->nread,work->buf.len);
     return uv_buf_init(work->buf.base+work->nread,
             work->buf.len-work->nread);
@@ -207,6 +288,7 @@ static uv_buf_t alloc_cb(uv_handle_t *handle, size_t suggested_size) {
 
 static void read_cb(uv_stream_t *handle, ssize_t nread, uv_buf_t buf) {
     work_t *work = (work_t*)handle->data;
+    session_t *session = work->session;
     work_dbg("read cb %d,%u",nread,buf.len);
     if(nread<0)
         work->nread = nread;
@@ -230,35 +312,91 @@ void connect_cb(uv_connect_t* req, int status) {
     work->cb(work,wa_process);
 }
 
-typedef struct host_node_s {
-    LIST_ENTRY(host_node_s) node;
-    host_t host;
-}host_node_t;
+#define work_ref(_work) obj_ref(work,_work)
+#define work_unref(_work) obj_unref(work,_work)
 
-typedef struct session_s {
-    uv_thread_t thread;
-    uv_loop_t *loop;
-    uv_async_t notify;
-    int active;
+#define WORK_EXIT do{\
+    PT_INIT(__pt);\
+    work_done(work);\
+    return PT_EXITED;\
+}while(0)
 
-    uv_mutex_t work_mutex;
-    TAILQ_HEAD(work_queue_s, work_s) work_queue;
+#define WORK_ABORT(_ret) do{\
+    work_dbg("work abort %d",_ret);\
+    work->ret = _ret;\
+    work->cb(work,wa_abort);\
+    WORK_EXIT;\
+}while(0)
 
-    uv_mutex_t mem_mutex;
-    SLIST_HEAD(device_blocks_s,device_block_s) device_blocks;
-    SLIST_HEAD(free_sync_list_s,sync_s) free_sync_list;
-    SLIST_HEAD(free_device_list_s, device_s) free_device_list;
-    TAILQ_HEAD(free_urb_list_s, urb_s) free_urb_list;
-    TAILQ_HEAD(free_work_list_s, work_s) free_work_list;
+#define WORK_ASYNC(_func,_arg) do{\
+    if((ret=_func _arg)) {\
+        err_uv(ret,#_func " failed");\
+        WORK_ABORT(uv_last_error(session->loop).code);\
+    }\
+}while(0)
 
-    LIST_HEAD(host_list_s,host_node_s) host_list;
-    size_t host_count;
-}session_t;
+#define READ_DONE(_obj) do{\
+    if(work->reading) {\
+        work->reading = 0;\
+        TAILQ_REMOVE(&(_obj)->read_list,work,node);\
+    }\
+}while(0)
+
+#define WORK_YIELD(_obj) do{\
+    work_dbg("yield");\
+    PT_YIELD(__pt);\
+    work_dbg("resume");\
+    READ_DONE(_obj);\
+    if(work->ret) {\
+        work_dbg("error %d",work->ret);\
+        WORK_EXIT;\
+    }else if(work->status < 0){ \
+        err_uv(work->status,"");\
+        WORK_ABORT(uv_last_error(session->loop).code);\
+    }\
+}while(0)
+
+#define WORK_RESTART do{\
+    work_dbg("restart");\
+    PT_RESTART(__pt);\
+}while(0)
+
+#define READ_PREPARE_(_obj, _buf,_size) do{\
+    if(!work->reading) {\
+        TAILQ_INSERT_HEAD(&(_obj)->read_list,work,node);\
+        work->reading = 1;\
+    }\
+    work->nread = 0;\
+    work->buf = uv_buf_init((char*)(_buf),_size);\
+    work_dbg("read prepare %d",_size);\
+}while(0)
+
+#define READ_PREPARE(_o,_obj) READ_PREPARE_(_o,&(_obj),sizeof(_obj))
+
+#define WORK_SET_ERR_(_work,_err) do{\
+    if(!_work->ret) _work->ret = -_err;\
+}while(0)
+
+#define WORK_SET_ERR(_err) WORK_SET_ERR_(work,_err)
+
+#define WORK_BEGIN(_pt) \
+{\
+    struct pt *__pt = _pt;\
+    PT_BEGIN(_pt);\
+    if(work->state != ws_busy || work->ret) {\
+        WORK_SET_ERR(UV_ECANCELED);\
+        work_dbg("abort on entry");\
+        WORK_EXIT;\
+    }\
+    work_dbg("begin");
+
+#define WORK_END PT_END(__pt) }
 
 static void work_del(work_t *work);
 
 static void timer_close_cb(uv_handle_t *handle) {
     work_t *work = container_of(handle,work_t,timer);
+    session_t *session = work->session;
     work->timer.data = 0;
     work_unref(work);
 }
@@ -271,7 +409,7 @@ static void work_del(work_t *work) {
         uv_close((uv_handle_t*)&work->timer,timer_close_cb);
         return;
     }
-    work_trace;
+    work_dbg("work del");
     work->cb(work,wa_destroy);
     uv_mutex_lock(&session->mem_mutex);
     if(work->sync) 
@@ -282,11 +420,12 @@ static void work_del(work_t *work) {
 
 #define work_done(_work) \
     do{\
-        work_dbg_(_work,"work done");\
+        work_log(DEBUG,_work,"work done");\
         work_done_(_work);\
     }while(0)
 
 static inline void work_done_(work_t *work) {
+    session_t *session = work->session;
     if(work->timer.data) 
         uv_timer_stop(&work->timer);
     if(work->sync)
@@ -301,10 +440,12 @@ static inline void work_done_(work_t *work) {
     work_unref(work);
 }
 
-static void timer_cb(uv_timer_t *timer, int status) {
+static void timedout_cb(uv_timer_t *timer, int status) {
     work_t *work = (work_t*)timer->data;
+    session_t *session = work->session;
     if(!status) {
-        work_dbg("work timeout");
+        work_dbg("work timeout %d",work->timeout);
+        WORK_SET_ERR(UV_ETIMEDOUT);
         work->cb(work,wa_abort);
     }else
         work_dbg("work timeout error %d",status);
@@ -329,7 +470,7 @@ static work_t *work_new_(session_t *session, void *data,
     else
         TAILQ_REMOVE(&session->free_work_list,work,node);
     memset(work,0,sizeof(work_t));
-    if(!job) {
+    if(!job && timeout>=0) {
         work->sync = SLIST_FIRST(&session->free_sync_list);
         if(work->sync == NULL){
             work->sync = (sync_t *)malloc(sizeof(sync_t));
@@ -340,8 +481,6 @@ static work_t *work_new_(session_t *session, void *data,
     }
     uv_mutex_unlock(&session->mem_mutex);
 
-    work_ref(work); /* unref by work_done */
-    work_ref(work); /* unref by libusbip_work_close */
     work->session = session;
     work->data = data;
     work->cb = cb;
@@ -351,8 +490,11 @@ static work_t *work_new_(session_t *session, void *data,
         work->user_cb = job->cb;
         work->user_data = job->data;
         job->work = work;
-    }
+        work_ref(work); /* unref by manually calling libusbip_work_close */
+    }else if(work->sync)
+        work_ref(work); /* unref by libusbip_work_close called in work_wait */
     work->timeout = timeout;
+    work_ref(work); /* unref by work_done */
     uv_mutex_lock(&session->work_mutex);
     TAILQ_INSERT_TAIL(&session->work_queue,work,node);
     uv_mutex_unlock(&session->work_mutex);
@@ -362,24 +504,26 @@ static work_t *work_new_(session_t *session, void *data,
 
 static int work_abort_cb(work_t *work, int action) {
     work_t *target = (work_t*)work->data;
+    session_t *session = work->session;
     if(action == wa_process) {
-        work_trace;
+        work_dbg("user abort cb");
+        WORK_SET_ERR_(target,UV_ECANCELED);
         if(target->state == ws_busy)
             target->cb(target,wa_abort);
-        if(target->state != ws_done)
-            target->state = ws_aborting;
         work_done(work);
     }
     return 0;
 }
 
 int libusbip_work_abort(work_t *work) {
-    work_trace;
-    work_new(work->session,work,work_abort_cb,0,0);
+    session_t *session = work->session;
+    work_dbg("user abort");
+    work_new(work->session,work,work_abort_cb,-1,0);
     return 0;
 }
 
 static int work_unref_cb(work_t *work,int action) {
+    session_t *session = work->session;
     if(action == wa_process) {
         work_unref((work_t*)work->data);
         work_done(work);
@@ -388,9 +532,10 @@ static int work_unref_cb(work_t *work,int action) {
 }
 
 void libusbip_work_close(work_t *work) {
-    work_trace;
+    session_t *session = work->session;
+    work_dbg("work close");
     /* since we are not in the loop thread, must unref the work asynchronously */
-    work_new(work->session,work,work_unref_cb,0,0);
+    work_new(work->session,work,work_unref_cb,-1,0);
 }
 
 static inline int work_is_done(work_t *work) {
@@ -412,20 +557,28 @@ static inline void urb_del(urb_t *urb) {
 }
 
 static void socket_close_cb(uv_handle_t *handle) {
+    work_t *work,*wtmp;
     urb_t *urb,*tmp; 
     device_t *dev = container_of(handle,device_t,socket);
+    session_t *session = dev->session;
     dev->state = devs_closed;
     TAILQ_FOREACH_SAFE(urb,&dev->urb_list,node,tmp) {
         TAILQ_REMOVE(&dev->urb_list,urb,node);
-        urb->work->ret = -1;
+        WORK_SET_ERR_(urb->work,UV_ECANCELED);
         work_done(urb->work);
+    }
+    TAILQ_FOREACH_SAFE(work,&dev->read_list,node,wtmp){
+        assert(work->reading);
+        WORK_SET_ERR(UV_ECANCELED);
+        work->status = -1;
+        work->cb(work,wa_process);
     }
     device_unref(dev);
 }
 
-#define device_close(_dev) \
+#define DEVICE_CLOSE(_dev) \
     do{\
-        if(_dev->state!=devs_closed && _dev->state!=devs_closing) {\
+        if(_dev->state>=devs_opening) {\
             _dev->state = devs_closing;\
             device_ref(_dev);\
             device_dbg("close socket");\
@@ -433,22 +586,29 @@ static void socket_close_cb(uv_handle_t *handle) {
         }\
     }while(0)
 
-static int work_submit(session_t *session, void *data, work_cb_t cb, 
-        int timeout, job_t *job)
+static int work_wait(work_t *work) {
+    session_t *session = work->session;
+    int ret;
+    uv_mutex_lock(&work->sync->mutex);
+    do{
+        uv_cond_wait(&work->sync->cond,&work->sync->mutex);
+    }while(!work_is_done(work));
+    uv_mutex_unlock(&work->sync->mutex);
+    ret = work->ret;
+    work_dbg("work finish %d",ret);
+    libusbip_work_close(work);
+    return ret;
+}
+
+#define work_submit(_s,_d,_cb,_t,_j) \
+    work_submit_(_s,_d,_cb,#_cb,_t,_j)
+static inline int work_submit_(session_t *session, void *data, work_cb_t cb, 
+        const char *cb_name, int timeout, job_t *job)
 {
     int ret;
-    work_t *work = work_new(session,data,cb,timeout,job);
+    work_t *work = work_new_(session,data,cb,cb_name,timeout,job);
     if(work == NULL) return -1;
-    if(work->sync) {
-        uv_mutex_lock(&work->sync->mutex);
-        do{
-            uv_cond_wait(&work->sync->cond,&work->sync->mutex);
-        }while(!work_is_done(work));
-        uv_mutex_unlock(&work->sync->mutex);
-        ret = work->ret;
-        libusbip_work_close(work);
-        return ret;
-    }
+    if(work->sync) return work_wait(work);
     return 0;
 }
 
@@ -465,15 +625,17 @@ static void session_notify(uv_async_t *handle, int status) {
         }
         TAILQ_REMOVE(&session->work_queue,work,node);
         uv_mutex_unlock(&session->work_mutex);
+        work_trace("deque %d",work->state);
         if(work->state == ws_pending) {
             work->state = ws_busy;
             /* TODO: do we need to adjust the timeout in case
              * the work is queued for too long??
              */
-            if(work->timeout) {
+            if(work->timeout>0) {
                 uv_timer_init(session->loop,&work->timer);
                 work->timer.data = work;
-                uv_timer_start(&work->timer,timer_cb,work->timeout,0);
+                work_dbg("start timer");
+                uv_timer_start(&work->timer,timedout_cb,work->timeout,0);
             }
         }
         work->cb(work,wa_process);
@@ -513,11 +675,26 @@ void libusbip_exit(session_t *session) {
     uv_mutex_destroy(&session->mem_mutex);
 }
 
-int libusbip_init(session_t **_session) {
+int session_start_cb(work_t *work, int action) {
+    session_t *session = work->session;
+    if(action == wa_process) 
+        session->start_time = uv_now(session->loop);
+    return 0;
+}
+
+void libusbip_set_debug(session_t *session, int level) {
+    session->log_level = level;
+}
+
+int libusbip_init(session_t **_session, int level) {
+    char *env_level = getenv("LIBUSBIP_LOG_LEVEL");
     char *hosts = getenv("LIBUSBIP_HOSTS");
     int ret;
     session_t *session = (session_t*)calloc(1,sizeof(session_t));
-
+    if(env_level)
+        session->log_level = atoi(env_level);
+    else
+        session->log_level = level; 
     if(hosts) {
         size_t len;
         char tmp[20];
@@ -579,6 +756,7 @@ int libusbip_init(session_t **_session) {
         return -1;
     }
     session->active = 1;
+    work_new(session,0,session_start_cb,-1,0);
     *_session = session;
     return 0;
 }
@@ -602,59 +780,8 @@ device_t *libusbip_device_cast(session_t *session, void *pt) {
     return ret;
 }
 
-#define WORK_EXIT \
-    do{\
-        work_done(work);\
-        return PT_EXITED;\
-    }while(0)
-
-#define WORK_ABORT(_ret) \
-    do{\
-        err("work abort");\
-        work->ret = _ret;\
-        work->cb(work,wa_abort);\
-        WORK_EXIT;\
-    }while(0)
-
-#define WORK_YIELD(pt) \
-    do{\
-        if(ret < 0){\
-            err("async op failed %d",ret);\
-            WORK_ABORT(-1); \
-        }else{\
-            work_dbg("yield");\
-            PT_YIELD(pt);\
-            work_dbg("resume");\
-        }\
-        if(work->status < 0){ \
-            uv_err_t err = uv_last_error(session->loop);\
-            err("work error %d, %d,%s,%s",work->status,\
-                    err.code,uv_err_name(err),uv_strerror(err));\
-            WORK_ABORT(-2);\
-        }\
-    }while(0)
-
-#define READ_PREPARE_(_buf,_size) \
-    do{\
-        work->nread = 0;\
-        work->buf = uv_buf_init((char*)(_buf),_size);\
-        work_dbg("read prepare %d",_size);\
-    }while(0)
-
-#define READ_PREPARE(_obj) READ_PREPARE_(&(_obj),sizeof(_obj))
-
-#define WORK_BEGIN(pt) \
-    PT_BEGIN(pt);\
-    if(work->state != ws_busy) {\
-        work->ret = -1;\
-        work_dbg("abort on entry");\
-        WORK_EXIT;\
-    }\
-    work_dbg("begin");
-
-#define WORK_END(pt) PT_END(pt)
-
 static inline int device_find_urb(device_t *dev) {
+    session_t *session = dev->session;
     urb_t *urb;
     TAILQ_FOREACH(urb,&dev->urb_list,node) {
         if(urb->work==NULL || 
@@ -674,12 +801,12 @@ static int device_loop(work_t *work, int action) {
     device_t *dev = (device_t*)work->data;
 
     if(action == wa_abort) {
-        dbg("abort device loop");
-        device_close(dev);
+        work_dbg("abort device loop");
+        DEVICE_CLOSE(dev);
         return 0;
     }
     if(action == wa_destroy) {
-        device_close(dev);
+        DEVICE_CLOSE(dev);
         device_unref(dev);
         return 0;
     }
@@ -689,44 +816,44 @@ static int device_loop(work_t *work, int action) {
     WORK_BEGIN(&dev->pt);
 
     dev->socket.data = work;
-    ret =  uv_read_start((uv_stream_t*)&dev->socket,alloc_cb,read_cb);
-
+    WORK_ASYNC(uv_read_start,((uv_stream_t*)&dev->socket,alloc_cb,read_cb));
     while(1) {
-        READ_PREPARE(dev->recv.header.base);
-        WORK_YIELD(&dev->pt);
+        READ_PREPARE(dev,dev->recv.header);
+        WORK_YIELD(dev);
         unpack_usbip_header_basic(&dev->recv.header.base);
         if(dev->recv.header.base.command == USBIP_RET_SUBMIT) {
-            READ_PREPARE(dev->recv.header.u.ret_submit);
-            WORK_YIELD(&dev->pt);
             unpack_usbip_header_ret_submit(&dev->recv.header.u.ret_submit);
             if(!device_find_urb(dev)) {
+                work_dbg("can't find urb %d",dev->recv.header.base.seqnum);
                 if(dev->recv.header.u.ret_submit.status == 0 && 
                     dev->recv.header.base.direction == USBIP_DIR_IN) {
-                    dbg("drop read %u",dev->recv.header.u.ret_submit.actual_length);
+                    work_dbg("drop read %u",dev->recv.header.u.ret_submit.actual_length);
                     while(dev->recv.header.u.ret_submit.actual_length) {
                         if(dev->recv.header.u.ret_submit.actual_length<sizeof(dev->recv.buf))
-                            READ_PREPARE_(dev->recv.buf, 
+                            READ_PREPARE_(dev,dev->recv.buf, 
                                     dev->recv.header.u.ret_submit.actual_length);
                         else
-                            READ_PREPARE_(dev->recv.buf, sizeof(dev->recv.buf));
-                        WORK_YIELD(&dev->pt);
-                        dev->recv.header.u.ret_submit.actual_length -= 
-                            work->nread;
+                            READ_PREPARE_(dev,dev->recv.buf, sizeof(dev->recv.buf));
+                        WORK_YIELD(dev);
+                        dev->recv.header.u.ret_submit.actual_length -= work->nread;
                     }
                 }
                 continue;
             }
-            if(dev->recv.header.u.ret_submit.status == 0 && 
-                dev->recv.header.base.direction == USBIP_DIR_IN) 
-            {
-                READ_PREPARE_(dev->recv.urb->buf.base,
-                        dev->recv.header.u.ret_submit.actual_length);
-                WORK_YIELD(&dev->pt);
-            }
-            dev->recv.urb->header.u.ret_submit = 
-                dev->recv.header.u.ret_submit;
+            work_dbg("urb %d,%u",dev->recv.header.u.ret_submit.status,
+                    dev->recv.header.u.ret_submit.actual_length);
+            dev->recv.urb->header.u.ret_submit = dev->recv.header.u.ret_submit;
             TAILQ_REMOVE(&dev->urb_list,dev->recv.urb,node);
-            *dev->recv.urb->ret = dev->recv.header.u.ret_submit.actual_length;
+            if((work->status = dev->recv.header.u.ret_submit.status))
+                WORK_SET_ERR(UV_EIO);
+            else{
+                if(dev->recv.urb->direction == USBIP_DIR_IN) {
+                    READ_PREPARE_(dev,dev->recv.urb->buf.base,
+                            dev->recv.header.u.ret_submit.actual_length);
+                    WORK_YIELD(dev);
+                }
+                *dev->recv.urb->ret = dev->recv.header.u.ret_submit.actual_length;
+            }
             work_done(dev->recv.urb->work);
             dev->recv.urb = NULL;
 
@@ -736,25 +863,28 @@ static int device_loop(work_t *work, int action) {
 
         }else{
             err("invalid rx command %u",dev->recv.header.base.command);
-            WORK_ABORT(-4);
+            WORK_ABORT(UV_EINVAL);
         }
     }
-    WORK_END(&dev->pt);
+    WORK_END;
 }
 
-#define CHECK_OP_REPLY(_op,_code) \
-    do{\
-        if(_op.version!=USBIP_VERSION_NUM) {\
-            err("usbip version mismatch %x,%x",USBIP_VERSION_NUM,_op.version);\
-            WORK_EXIT;\
-        }else if(_op.code!=_code) {\
-            err("usbip op code mismatch %d,%d",_code,_op.code);\
-            WORK_EXIT;\
-        }else if(_op.status!=ST_OK) {\
-            err("usip op error %d",_op.status);\
-            WORK_EXIT;\
-        }\
-    }while(0)
+#define CHECK_OP_REPLY(_op,_code) do{\
+    unpack_op_common(_op);\
+    if((_op)->version!=USBIP_VERSION_NUM) {\
+        err("usbip version mismatch %x,%x",USBIP_VERSION_NUM,(_op)->version);\
+        WORK_ABORT(UV_EINVAL);\
+    }else if((_op)->code!=_code) {\
+        err("usbip op code mismatch %d,%d",_code,(_op)->code);\
+        WORK_ABORT(UV_EINVAL);\
+    }\
+}while(0)
+
+static void device_timer_close_cb(uv_handle_t *handle) {
+    device_t *dev = (device_t*)handle->data;
+    session_t *session = dev->session;
+    device_unref(dev);
+}
 
 static int device_open_cb(work_t *work, int action) {
     char addr[64];
@@ -764,16 +894,22 @@ static int device_open_cb(work_t *work, int action) {
     device_t *dev = (device_t*)work->data;
 
     if(action == wa_abort) {
-        dbg("abort device open");
-        device_close(dev);
+        work_dbg("abort device open");
+        if(dev->state == devs_restarting){
+            dev->state = devs_closed;
+            uv_timer_stop(&dev->timer);
+            work_done(work);
+        }else
+            DEVICE_CLOSE(dev);
         return 0;
-    }
-    if(action == wa_destroy) {
-        device_close(dev);
-        device_unref(dev);
+    }else if(action == wa_destroy) {
+        if(dev->timer.data){
+            dev->timer.data = dev;
+            uv_close((uv_handle_t*)&dev->timer,device_timer_close_cb);
+        }else
+            device_unref(dev);
         return 0;
-    }
-    if(action != wa_process)
+    }else if(action != wa_process)
         return -1;
 
     WORK_BEGIN(&dev->pt);
@@ -781,15 +917,16 @@ static int device_open_cb(work_t *work, int action) {
     ret = uv_tcp_init(session->loop,&dev->socket);
     if(ret < 0){
         err("tcp init failed");
+        WORK_SET_ERR(uv_last_error(session->loop).code);
         WORK_EXIT;
     }
     dev->socket.data = work;
     dev->state = devs_opening;
     dev->connect.req_connect.data = work;
-    dbg("connecting to %s",(uv_ip4_name(&dev->addr,addr,sizeof(addr)),addr));
-    ret = uv_tcp_connect(&dev->connect.req_connect,
-            &dev->socket,dev->addr,connect_cb);
-    WORK_YIELD(&dev->pt);
+    device_dbg("connecting to %s",(uv_ip4_name(&dev->addr,addr,sizeof(addr)),addr));
+    WORK_ASYNC(uv_tcp_connect,(&dev->connect.req_connect,
+            &dev->socket,dev->addr,connect_cb));
+    WORK_YIELD(dev);
 
     dev->connect.req_write.data = work;
     dev->connect.op_header.version = USBIP_VERSION_NUM;
@@ -798,54 +935,75 @@ static int device_open_cb(work_t *work, int action) {
 	pack_op_common(&dev->connect.op_header);
     buf[0] = uv_buf_init((char*)&dev->connect.op_header,
             sizeof(dev->connect.op_header));
+    device_dbg("import device %s",dev->connect.req_import.busid);
 
-    snprintf(dev->connect.req_import.busid,
-            sizeof(dev->connect.req_import.busid),
-            "%u-%u",dev->devid>>16,dev->devid&0xffff);
     buf[1] = uv_buf_init((char*)&dev->connect.req_import,
             sizeof(dev->connect.req_import));
 
     dev->connect.req_write.data = work;
-    ret = uv_write(&dev->connect.req_write, 
-            (uv_stream_t*)&dev->socket, buf, 2, write_cb);
-    WORK_YIELD(&dev->pt);
+    WORK_ASYNC(uv_read_start,((uv_stream_t*)&dev->socket,alloc_cb,read_cb));
 
-    READ_PREPARE(dev->connect.op_header);
-    ret =  uv_read_start((uv_stream_t*)&dev->socket,alloc_cb,read_cb);
-    WORK_YIELD(&dev->pt);
-    CHECK_OP_REPLY(dev->connect.op_header,OP_REQ_IMPORT);
+    WORK_ASYNC(uv_write,(&dev->connect.req_write, 
+            (uv_stream_t*)&dev->socket, buf, 2, write_cb));
+    WORK_YIELD(dev);
 
-    READ_PREPARE(dev->connect.rpl_import);
-    WORK_YIELD(&dev->pt);
+    READ_PREPARE(dev,dev->connect.op_header);
+    WORK_YIELD(dev);
+    CHECK_OP_REPLY(&dev->connect.op_header,OP_REP_IMPORT);
+    if(dev->connect.op_header.status!=ST_OK) {
+        err("usbip import error %d",dev->connect.op_header.status);
+        if(++dev->connect.retry > dev->max_retry)
+            WORK_ABORT(UV_EBUSY);
 
-	unpack_op_import_reply(&dev->connect.rpl_import);
-	if(strncmp(dev->connect.rpl_import.udev.busid, 
+        assert(dev->state==devs_opening);
+        dev->state = devs_closing;
+        device_dbg("restart socket");
+        uv_close((uv_handle_t*)&dev->socket,close_cb);
+        WORK_YIELD(dev);
+        dev->state = devs_restarting;
+        if(dev->timer.data == 0) {
+            uv_timer_init(session->loop,&dev->timer);
+            dev->timer.data = work;
+        }
+        uv_timer_start(&dev->timer,timer_cb,500,0);
+        WORK_RESTART;
+    }
+
+    READ_PREPARE(dev,dev->connect.rpl_import);
+    WORK_YIELD(dev);
+
+    unpack_op_import_reply(&dev->connect.rpl_import);
+    if(strncmp(dev->connect.rpl_import.udev.busid, 
                 dev->connect.req_import.busid, 
-                sizeof(dev->connect.req_import.busid))) 
-    {
-        err("recv different bus id");
-        WORK_ABORT(-3);
+                sizeof(dev->connect.req_import.busid))) {
+        err("busid mismatch %s,%s",dev->connect.req_import.busid,
+                dev->connect.rpl_import.udev.busid);
+        WORK_ABORT(UV_EINVAL);
     }
 
     /* pause the read first, and resume it in device_loop */
     dev->socket.data = 0;
     uv_read_stop((uv_stream_t*)&dev->socket);
     device_ref(dev);
-    work_new(work->session,dev,device_loop,0,0);
+    work_new(work->session,dev,device_loop,-1,0);
 
     work->ret = 0;
+    *dev->pdev = dev;
+    /* device returned to user, expect to unref in libusbip_device_close */
+    device_ref(dev);
     WORK_EXIT;
 
-    WORK_END(&dev->pt);
+    WORK_END;
 }
 
 int libusbip_device_open(session_t *session, device_t **pdev,
         const char *addr, int port, const char *busid,
-        int timeout, libusbip_job_t *job)
+        int retry, int timeout, libusbip_job_t *job)
 {
     device_t *dev;
     unsigned busnum,devnum;
-    if(sscanf(busid,"%u-%u",&busnum,&devnum)!=2){
+    char id[32];
+    if(sscanf(busid,"%u-%u:%32s",&busnum,&devnum,id)!=3){
         err("invalid busid %s",busid);
         return -1;
     }
@@ -855,6 +1013,7 @@ int libusbip_device_open(session_t *session, device_t **pdev,
         int i;
         device_block_t *block = (device_block_t*)malloc(
                 sizeof(device_block_t));
+        SLIST_INSERT_HEAD(&session->device_blocks,block,node);
         for(i=0;i<array_sizeof(block->devices);++i)
             SLIST_INSERT_HEAD(&session->free_device_list,
                     &block->devices[i],node);
@@ -864,13 +1023,19 @@ int libusbip_device_open(session_t *session, device_t **pdev,
     uv_mutex_unlock(&session->mem_mutex);
 
     memset(dev,0,sizeof(device_t));
-    device_ref(dev);
+    TAILQ_INIT(&dev->read_list);
+    TAILQ_INIT(&dev->urb_list);
+    strncpy(dev->connect.req_import.busid,id,
+            sizeof(dev->connect.req_import.busid)-1);
+    dev->session = session;
+    dev->max_retry = retry;
     dev->devid = (busnum<<16|devnum);
     PT_INIT(&dev->pt);
     if(port == 0) port = USBIP_PORT;
-    device_dbg("open %s,%d",addr,port);
+    device_dbg("open %s,%d,%u-%u:%s",addr,port,busnum,devnum,
+            dev->connect.req_import.busid);
     dev->addr = uv_ip4_addr(addr,port);
-    *pdev = dev;
+    dev->pdev = pdev;
 
     device_ref(dev);
     return work_submit(session,dev,device_open_cb,timeout,job);
@@ -878,16 +1043,16 @@ int libusbip_device_open(session_t *session, device_t **pdev,
 
 static int device_close_cb(work_t *work, int action) {
     device_t *dev = (device_t*)work->data;
+    session_t *session = work->session;
     if(action == wa_process) {
-        work_trace;
-        device_close(dev);
-        device_unref(dev);
+        DEVICE_CLOSE(dev);
         work_done(work);
+        device_unref(dev);
     }
 }
 
 void libusbip_device_close(device_t *dev) {
-    device_ref(dev);
+    session_t *session = dev->session;
     work_submit(dev->session,dev,device_close_cb,0,0);
 }
 
@@ -904,20 +1069,22 @@ static urb_t *urb_new(device_t *dev) {
     uv_mutex_unlock(&session->mem_mutex);
 
     memset(ret,0,sizeof(urb_t));
+    ret->dev = dev;
     PT_INIT(&ret->pt);
     return ret;
 }
 
 static int device_urb_transfer(work_t *work, int action) {
-    int ret;
-    uv_buf_t buf;
+    int ret = 0;
+    uv_buf_t buf[2];
+    int buf_count = 1;
     urb_t *urb = (urb_t*)work->data;
     device_t *dev = urb->dev;
     session_t *session = work->session;
 
     if(action == wa_abort) {
-        dbg("abort urb transfer");
-        device_close(dev);
+        work_dbg("abort urb transfer");
+        DEVICE_CLOSE(dev);
         return 0;
     }
     if(action == wa_destroy) {
@@ -938,37 +1105,35 @@ static int device_urb_transfer(work_t *work, int action) {
     if(urb->header.base.command == USBIP_CMD_SUBMIT) {
         urb->header.u.cmd_submit.transfer_buffer_length = urb->buf.len;
         pack_usbip_header_cmd_submit(&urb->header.u.cmd_submit);
-        buf = uv_buf_init((char*)&urb->header,sizeof(urb->header.base)+
-                sizeof(urb->header.u.cmd_submit));
     }else{
         err("invalid urb command %u",urb->header.base.command);
-        WORK_ABORT(-1);
+        WORK_ABORT(UV_EINVAL);
     }
     pack_usbip_header_basic(&urb->header.base);
-
+    buf[0] = uv_buf_init((char*)&urb->header,sizeof(urb->header));
+    if(urb->buf.len && urb->direction == USBIP_DIR_OUT)  {
+        work_dbg("output %u",urb->buf.len);
+        buf_count = 2;
+        buf[1] = urb->buf;
+    }else
+        work_dbg("input %u",urb->buf.len);
     urb->req_write.data = work;
-    ret = uv_write(&urb->req_write, (uv_stream_t*)&dev->socket, &buf, 1, write_cb);
-    WORK_YIELD(&dev->pt);
-    if(urb->buf.len) {
-        if(urb->direction == USBIP_DIR_OUT) 
-            ret = uv_write(&urb->req_write,
-                    (uv_stream_t*)&dev->socket,&urb->buf,1,write_cb);
-        else
-            READ_PREPARE_(urb->buf.base,urb->buf.len);
-        WORK_YIELD(&dev->pt);
-    }
+    WORK_ASYNC(uv_write,(&urb->req_write, (uv_stream_t*)&dev->socket, buf, buf_count, write_cb));
+    WORK_YIELD(dev);
 
     /* work not done yet, put in the device urb list and wait for device_loop 
      * to call work_done on urb */
+    work_dbg("urb wait");
     TAILQ_INSERT_TAIL(&dev->urb_list,urb,node);
     return PT_EXITED;
 
-    WORK_END(&dev->pt);
+    WORK_END;
 }
 
 int libusbip_control_msg(device_t *dev, int requesttype, int request,
 	int value, int index, char *bytes, int size, int *ret, int timeout, job_t *job)
 {
+    session_t *session = dev->session;
     usb_ctrlrequest_t *req;
     urb_t *urb = urb_new(dev);
     urb->header.base.command = USBIP_CMD_SUBMIT;
@@ -992,6 +1157,7 @@ int libusbip_control_msg(device_t *dev, int requesttype, int request,
 int libusbip_urb_transfer(device_t *dev, int ep, int urbtype,
 	void *data, int size, int *ret, int timeout, job_t *job)
 {
+    session_t *session = dev->session;
     urb_t *urb = urb_new(dev);
 	urb->header.base.command   = USBIP_CMD_SUBMIT;
 	urb->header.base.direction = ep&0x80?USBIP_DIR_IN:USBIP_DIR_OUT;
@@ -1011,7 +1177,7 @@ void libusbip_add_hosts(session_t *session, host_t *hosts, unsigned count)
     for(i=0;i<count;++i) {
         host_node_t *h = (host_node_t*)malloc(sizeof(host_node_t));
         h->host = hosts[i];
-        dbg("adding static host %s %d",h->host.addr,h->host.port);
+        log(DEBUG,"adding static host %s %d",h->host.addr,h->host.port);
         LIST_INSERT_HEAD(&session->host_list,h,node);
     }
     uv_mutex_unlock(&session->mem_mutex);
@@ -1059,6 +1225,7 @@ void libusbip_free_hosts(session_t *session, host_t *hosts)
 }
 
 typedef struct device_info_req_s {
+    session_t *session;
     struct pt pt;
     struct sockaddr_in addr;
     struct usbip_usb_device udev;
@@ -1074,6 +1241,8 @@ typedef struct device_info_req_s {
     unsigned count;
     device_info_t **pinfo;
     unsigned *pcount;
+
+    TAILQ_HEAD(req_read_list_s,work_s) read_list;
 }device_info_req_t;
 
 #define device_info_t libusbip_device_info_t
@@ -1090,18 +1259,26 @@ void libusbip_free_devices_info(session_t *session,
 #define device_info_req_ref(_req) obj_ref(device_info_req,_req)
 #define device_info_req_unref(_req) obj_unref(device_info_req,_req)
 #define device_info_req_del(req) free(req)
-#define device_info_req_dbg dbg
 
 static void device_info_req_close_cb(uv_handle_t *handle) {
+    work_t *work,*wtmp;
     device_info_req_t *req = container_of(handle,device_info_req_t,socket);
+    session_t *session = req->session;
+    TAILQ_FOREACH_SAFE(work,&req->read_list,node,wtmp){
+        assert(work->reading);
+        WORK_SET_ERR(UV_ECANCELED);
+        work->status = -1;
+        work->cb(work,wa_process);
+    }
     device_info_req_unref(req);
 }
 
 static inline void device_info_req_close(device_info_req_t *req) {
+    session_t *session = req->session;
     if(!req->active) return;
     req->active = 0;
     device_info_req_ref(req);
-    dbg("close device info request");
+    log(DEBUG,"close device info request");
     uv_close((uv_handle_t*)&req->socket,device_info_req_close_cb);
 }
 
@@ -1128,15 +1305,16 @@ static int device_info_req_cb(work_t *work, int action) {
     WORK_BEGIN(&req->pt);
     ret = uv_tcp_init(session->loop,&req->socket);
     if(ret < 0){
-        dbg("tcp init failed");
+        err("tcp init failed");
+        WORK_SET_ERR(work->ret);
         WORK_EXIT;
     }
     req->active = 1;
     req->socket.data = work;
     req->connect.data = work;
-    dbg("connecting to %s",(uv_ip4_name(&req->addr,addr,sizeof(addr)),addr));
-    ret = uv_tcp_connect(&req->connect,&req->socket,req->addr,connect_cb);
-    WORK_YIELD(&req->pt);
+    work_dbg("connecting to %s",(uv_ip4_name(&req->addr,addr,sizeof(addr)),addr));
+    WORK_ASYNC(uv_tcp_connect,(&req->connect,&req->socket,req->addr,connect_cb));
+    WORK_YIELD(req);
 
     req->write.data = work;
     req->header.version = USBIP_VERSION_NUM;
@@ -1146,32 +1324,36 @@ static int device_info_req_cb(work_t *work, int action) {
     buf = uv_buf_init((char*)&req->header, sizeof(req->header));
 
     req->write.data = work;
-    ret = uv_write(&req->write, (uv_stream_t*)&req->socket, &buf, 1, write_cb);
-    WORK_YIELD(&req->pt);
+    WORK_ASYNC(uv_write,(&req->write, (uv_stream_t*)&req->socket, &buf, 1, write_cb));
+    WORK_YIELD(req);
 
-    READ_PREPARE(req->header);
+    READ_PREPARE(req,req->header);
     ret =  uv_read_start((uv_stream_t*)&req->socket,alloc_cb,read_cb);
-    WORK_YIELD(&req->pt);
-    CHECK_OP_REPLY(req->header,OP_REQ_DEVLIST);
+    WORK_YIELD(req);
+    CHECK_OP_REPLY(&req->header,OP_REP_DEVLIST);
+    if(req->header.status != ST_OK) {
+        err("usbip op error %d",req->header.status);
+        WORK_ABORT(UV_EINVAL);
+    }
 
-    READ_PREPARE(req->reply);
-    WORK_YIELD(&req->pt);
+    READ_PREPARE(req,req->reply);
+    WORK_YIELD(req);
     unpack_op_devlist_reply(&req->reply);
 
-    dbg("list device %u",req->reply.ndev);
+    work_dbg("list device %u",req->reply.ndev);
 
     *req->pinfo = req->info = (device_info_t *)
         calloc(req->reply.ndev,sizeof(device_info_t));
     for(;req->count<req->reply.ndev;++req->count,*req->pcount=req->count) {
         device_info_t *info;
-        READ_PREPARE(req->udev);
-        WORK_YIELD(&req->pt);
+        READ_PREPARE(req,req->udev);
+        WORK_YIELD(req);
         unpack_usbip_usb_device(&req->udev);
 
-        dbg("device %u,%u,%s",req->udev.busnum,req->udev.devnum,req->udev.busid);
+        work_dbg("device %u-%u:%s",req->udev.busnum,req->udev.devnum,req->udev.busid);
 
         info = &req->info[req->count];
-        strncpy(info->busid,req->udev.busid,sizeof(info->busid));
+        strncpy(info->busid,req->udev.busid,sizeof(info->busid)-1);
         info->busnum=req->udev.busnum;
         info->devnum=req->udev.devnum;
         info->speed=req->udev.speed;
@@ -1187,8 +1369,8 @@ static int device_info_req_cb(work_t *work, int action) {
                 sizeof(device_interface_t));
         for(;info->bNumInterfaces<req->udev.bNumInterfaces; ++info->bNumInterfaces) {
             device_interface_t *intf;
-            READ_PREPARE(req->intf);
-            WORK_YIELD(&req->pt);
+            READ_PREPARE(req,req->intf);
+            WORK_YIELD(req);
             unpack_usbip_usb_interface(&req->intf);
             info = &req->info[req->count];
             intf = &info->interfaces[info->bNumInterfaces];
@@ -1201,19 +1383,20 @@ static int device_info_req_cb(work_t *work, int action) {
     work_done(work);
     return PT_EXITED;
 
-    WORK_END(&req->pt);
+    WORK_END;
 }
 
 int libusbip_get_devices_info(session_t *session, host_t *host, 
         device_info_t **info, unsigned *count, 
         int timeout, libusbip_job_t *job)
 {
-    int ret;
     int port = host->port;
     device_info_req_t *req;
     if(info == 0 || count == 0)
         return -1;
-    req = calloc(1,sizeof(device_info_req_t));
+    req = (device_info_req_t*)calloc(1,sizeof(device_info_req_t));
+    req->session = session;
+    TAILQ_INIT(&req->read_list);
     if(port == 0) port = USBIP_PORT;
     req->addr = uv_ip4_addr(host->addr,port);
     PT_INIT(&req->pt);
