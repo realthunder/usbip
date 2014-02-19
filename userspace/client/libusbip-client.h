@@ -76,7 +76,7 @@ LIBUSBIP_EXTERN void libusbip_add_hosts(libusbip_session_t *session,
 LIBUSBIP_EXTERN int libusbip_remove_hosts(libusbip_session_t *session, 
         libusbip_host_t *hosts, unsigned count);
 LIBUSBIP_EXTERN int libusbip_find_hosts(libusbip_session_t *session,
-        libusbip_host_t **hosts, int timeout, libusbip_job_t *job);
+        libusbip_host_t **hosts, unsigned *count, int timeout, libusbip_job_t *job);
 LIBUSBIP_EXTERN void libusbip_free_hosts(libusbip_session_t *session, 
         libusbip_host_t *hosts);
 LIBUSBIP_EXTERN int libusbip_get_devices_info(libusbip_session_t *session,
@@ -87,7 +87,8 @@ LIBUSBIP_EXTERN void libusbip_free_devices_info(libusbip_session_t *session,
 
 LIBUSBIP_EXTERN int libusbip_device_open(libusbip_session_t *session,
         libusbip_device_t **dev, const char *addr, int port, 
-        const char *devid, int retry, int timeout, libusbip_job_t *job);
+        const char *busid, unsigned busnum, unsigned devnum, 
+        int retry, int timeout, libusbip_job_t *job);
 LIBUSBIP_EXTERN libusbip_device_t *libusbip_device_cast(
         libusbip_session_t *session, void *pt);
 
@@ -98,12 +99,12 @@ LIBUSBIP_EXTERN int libusbip_work_abort(libusbip_work_t *work);
  * You must not free any work related resource until your callback is invoked */ 
 LIBUSBIP_EXTERN void libusbip_work_close(libusbip_work_t *work);
 
-#define USBIP_URB_TYPE_ISO	0
-#define USBIP_URB_TYPE_INTERRUPT	1
-#define USBIP_URB_TYPE_CONTROL	2
-#define USBIP_URB_TYPE_BULK	3
+#define USBIP_EP_TYPE_CONTROL	0
+#define USBIP_EP_TYPE_ISO	1
+#define USBIP_EP_TYPE_BULK	2
+#define USBIP_EP_TYPE_INTERRUPT	3
 LIBUSBIP_EXTERN int libusbip_urb_transfer(
-        libusbip_device_t *dev, int ep, int urbtype,
+        libusbip_device_t *dev, int ep, int ep_type,
 	    void *data, int size, int *ret, int timeout, libusbip_job_t *job);
 
 LIBUSBIP_EXTERN int libusbip_control_msg(

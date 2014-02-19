@@ -998,15 +998,10 @@ static int device_open_cb(work_t *work, int action) {
 
 int libusbip_device_open(session_t *session, device_t **pdev,
         const char *addr, int port, const char *busid,
+        unsigned busnum, unsigned devnum,
         int retry, int timeout, libusbip_job_t *job)
 {
     device_t *dev;
-    unsigned busnum,devnum;
-    char id[32];
-    if(sscanf(busid,"%u-%u:%32s",&busnum,&devnum,id)!=3){
-        err("invalid busid %s",busid);
-        return -1;
-    }
 
     uv_mutex_lock(&session->mem_mutex);
     if(SLIST_EMPTY(&session->free_device_list)) {
@@ -1025,7 +1020,7 @@ int libusbip_device_open(session_t *session, device_t **pdev,
     memset(dev,0,sizeof(device_t));
     TAILQ_INIT(&dev->read_list);
     TAILQ_INIT(&dev->urb_list);
-    strncpy(dev->connect.req_import.busid,id,
+    strncpy(dev->connect.req_import.busid,busid,
             sizeof(dev->connect.req_import.busid)-1);
     dev->session = session;
     dev->max_retry = retry;
@@ -1154,7 +1149,7 @@ int libusbip_control_msg(device_t *dev, int requesttype, int request,
     return work_submit(dev->session,urb,device_urb_transfer, timeout,job);
 }
 
-int libusbip_urb_transfer(device_t *dev, int ep, int urbtype,
+int libusbip_urb_transfer(device_t *dev, int ep, int ep_type,
 	void *data, int size, int *ret, int timeout, job_t *job)
 {
     session_t *session = dev->session;
@@ -1203,7 +1198,7 @@ int libusbip_remove_hosts(session_t *session, host_t *hosts, unsigned count)
     return ret;
 }
 
-int libusbip_find_hosts(session_t *session, host_t **phosts, 
+int libusbip_find_hosts(session_t *session, host_t **phosts, unsigned *count,
         int timeout, libusbip_job_t *job)
 {
     int i = 0;
@@ -1216,7 +1211,8 @@ int libusbip_find_hosts(session_t *session, host_t **phosts,
         hosts[i++] = h->host;
     uv_mutex_unlock(&session->mem_mutex);
     *phosts = hosts;
-    return i;
+    *count = i;
+    return 0;
 }
 
 void libusbip_free_hosts(session_t *session, host_t *hosts)
@@ -1399,6 +1395,7 @@ int libusbip_get_devices_info(session_t *session, host_t *host,
     TAILQ_INIT(&req->read_list);
     if(port == 0) port = USBIP_PORT;
     req->addr = uv_ip4_addr(host->addr,port);
+    log(DEBUG,"host %s,%d",host->addr,port);
     PT_INIT(&req->pt);
     req->pinfo = info;
     req->pcount = count;

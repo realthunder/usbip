@@ -218,6 +218,8 @@ struct usb_dev_handle *usb_os_open(struct usb_device *udev) {
     int ret;
     libusbip_device_t *dev = NULL;
     usb_dev_handle *handle;
+    char busid[32];
+    unsigned busnum,devnum;
 
     if(hook.func_usb_open) {
         if(!is_usbip_device(udev)) 
@@ -241,9 +243,14 @@ struct usb_dev_handle *usb_os_open(struct usb_device *udev) {
         goto ON_ERROR;
     }
 
+    if(sscanf(udev->filename,"%u-%u:%32s",&busnum,&devnum,id)!=3){
+        err("invalid device filename %s",udev->filename);
+        goto ON_ERROR;
+    }
+
     ret = libusbip_device_open(session,&dev,
             get_hostname(handle->bus),handle->bus->location,
-            handle->device->filename,3,5000,0);
+            id,busnum,devnum,3,5000,0);
     if(ret) goto ON_ERROR;
     handle->impl_info = dev;
     return handle;
@@ -321,7 +328,7 @@ int usb_bulk_write(usb_dev_handle *handle, int ep, const char *bytes, int size,
 {
     int ret = -1;
     CAST_DEVICE(usb_bulk_write,(handle,ep,bytes,size,timeout));
-    libusbip_urb_transfer(dev,ep,USBIP_URB_TYPE_BULK,(void*)bytes,size,&ret,timeout,0);
+    libusbip_urb_transfer(dev,ep,USBIP_EP_TYPE_BULK,(void*)bytes,size,&ret,timeout,0);
     return ret;
 }
 
@@ -330,7 +337,7 @@ int usb_bulk_read(usb_dev_handle *handle, int ep, char *bytes, int size,
 {
     int ret = -1;
     CAST_DEVICE(usb_bulk_read,(handle,ep,bytes,size,timeout));
-    libusbip_urb_transfer(dev,ep,USBIP_URB_TYPE_BULK,bytes,size,&ret,timeout,0);
+    libusbip_urb_transfer(dev,ep,USBIP_EP_TYPE_BULK,bytes,size,&ret,timeout,0);
     return ret;
 }
 
@@ -339,7 +346,7 @@ int usb_interrupt_write(usb_dev_handle *handle, int ep, const char *bytes, int s
 {
     int ret = -1;
     CAST_DEVICE(usb_interrupt_write,(handle,ep,bytes,size,timeout));
-    libusbip_urb_transfer(dev,ep,USBIP_URB_TYPE_INTERRUPT,(void*)bytes,size,&ret,timeout,0);
+    libusbip_urb_transfer(dev,ep,USBIP_EP_TYPE_INTERRUPT,(void*)bytes,size,&ret,timeout,0);
     return ret;
 }
 
@@ -348,7 +355,7 @@ int usb_interrupt_read(usb_dev_handle *handle, int ep, char *bytes, int size,
 {
     int ret = -1;
     CAST_DEVICE(usb_interrupt_read,(handle,ep,bytes,size,timeout));
-    libusbip_urb_transfer(dev,ep,USBIP_URB_TYPE_INTERRUPT,bytes,size,&ret,timeout,0);
+    libusbip_urb_transfer(dev,ep,USBIP_EP_TYPE_INTERRUPT,bytes,size,&ret,timeout,0);
     return ret;
 }
 
@@ -358,6 +365,7 @@ int usb_os_find_busses(struct usb_bus **busses)
     struct usb_bus *bus = NULL;
     struct usb_bus *fbus = NULL;
     ssize_t i,ret;
+    unsigned count = 0;
 
     if(hook.func_usb_os_find_busses) {
         hook.func_usb_os_find_busses(&bus);
@@ -394,9 +402,9 @@ int usb_os_find_busses(struct usb_bus **busses)
             hook.func_usb_find_devices();
     }
 
-    ret = libusbip_find_hosts(session,&hosts,5000,0);
+    ret = libusbip_find_hosts(session,&hosts,&count,5000,0);
     if(ret < 0) return -1;
-    for(i=0;i<ret;++i) {
+    for(i=0;i<count;++i) {
         bus = (struct usb_bus *)calloc(1,sizeof(struct usb_bus));
         bus->location = hosts[i].port;
         snprintf(bus->dirname,sizeof(bus->dirname),"/usbip/%s", hosts[i].addr);
