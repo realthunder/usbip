@@ -1,4 +1,4 @@
-# You may symlink ./deps to libuv directory
+# You may symlink ./deps/uv to libuv directory
 CFLAGS= -g -I./deps/uv/include
 all: libusbip-client.a libusb-usbip
 
