@@ -27,6 +27,14 @@
 #include <linux/moduleparam.h>
 #include <net/sock.h>
 
+#include <linux/version.h>
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3,9,0))
+static inline struct inode *file_inode(struct file *f)
+{
+	return f->f_path.dentry->d_inode;
+}
+#endif
+
 #include "usbip_common.h"
 
 #define DRIVER_AUTHOR "Takahiro Hirofuchi <hirofuchi@users.sourceforge.net>"
